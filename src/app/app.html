@@ -69,36 +69,43 @@
         <div class="system-list">
           <div class="system-list__item">
             <span>
-              <strong>Frontend Angular</strong>
-              <small>Interface utilisateur</small>
-            </span>
-
-            <span class="service-state service-state--online">
-              Disponible
-            </span>
-          </div>
-
-          <div class="system-list__item">
-            <span>
               <strong>Backend Spring Boot</strong>
-              <small>Connexion prévue en 10.3</small>
+
+              @if (backendHealth(); as health) {
+                <small>
+                  {{ health.service }} · Statut {{ health.status }}
+                </small>
+              } @else {
+                <small>
+                  Vérification de l'API Bank Platform
+                </small>
+              }
             </span>
 
-            <span class="service-state service-state--waiting">
-              À connecter
-            </span>
-          </div>
+            @switch (backendConnectionState()) {
+              @case ('loading') {
+                <span class="service-state service-state--waiting">
+                  Connexion…
+                </span>
+              }
 
-          <div class="system-list__item">
-            <span>
-              <strong>Observabilité</strong>
-              <small>Prometheus, Grafana, Loki et Tempo</small>
-            </span>
+              @case ('online') {
+                <span class="service-state service-state--online">
+                  Disponible
+                </span>
+              }
 
-            <span class="service-state service-state--online">
-              Disponible
-            </span>
-          </div>
+              @case ('offline') {
+                <button
+                  type="button"
+                  class="service-retry"
+                  (click)="loadBackendStatus()"
+                >
+                  Réessayer
+                </button>
+              }
+            }
+          </div>          
         </div>
       </aside>
     </section>

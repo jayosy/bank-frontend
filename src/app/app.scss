@@ -266,6 +266,29 @@ main {
   color: #6ee7b7;
 }
 
+.service-state--offline {
+  color: #fca5a5;
+}
+
+.service-retry {
+  padding: 0.38rem 0.65rem;
+  border: 1px solid rgba(252, 165, 165, 0.35);
+  border-radius: 999px;
+  color: #fecaca;
+  background: rgba(185, 28, 28, 0.2);
+  font-size: 0.72rem;
+  font-weight: 800;
+  cursor: pointer;
+  transition:
+    background-color 160ms ease,
+    transform 160ms ease;
+}
+
+.service-retry:hover {
+  background: rgba(185, 28, 28, 0.35);
+  transform: translateY(-1px);
+}
+
 .service-state--waiting {
   color: #fcd34d;
 }

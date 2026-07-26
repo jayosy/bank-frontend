@@ -1,4 +1,7 @@
-import { ChangeDetectionStrategy, Component } from '@angular/core';
+import { ChangeDetectionStrategy, Component, inject, OnInit, signal } from '@angular/core';
+
+import { BackendHealth } from './core/models/backend-health';
+import { BackendHealthService } from './core/services/backend-health.service';
 
 interface DashboardMetric {
   readonly label: string;
@@ -24,7 +27,42 @@ interface RecentTransaction {
   styleUrl: './app.scss',
   changeDetection: ChangeDetectionStrategy.OnPush
 })
-export class App {
+export class App implements OnInit{
+
+  private readonly backendHealthService =
+  inject(BackendHealthService);
+
+  protected readonly backendHealth =
+    signal<BackendHealth | null>(null);
+
+  protected readonly backendConnectionState =
+    signal<BackendConnectionState>('loading');
+
+  ngOnInit(): void {
+    this.loadBackendStatus();
+  }
+
+  protected loadBackendStatus(): void {
+    this.backendConnectionState.set('loading');
+    this.backendHealth.set(null);
+
+    this.backendHealthService.getHealth().subscribe({
+      next: (health: BackendHealth) => {
+        this.backendHealth.set(health);
+
+        this.backendConnectionState.set(
+          health.status.toUpperCase() === 'UP'
+            ? 'online'
+            : 'offline'
+        );
+      },
+      error: () => {
+        this.backendHealth.set(null);
+        this.backendConnectionState.set('offline');
+      }
+    });
+  }
+  
   protected readonly applicationName = 'Bank Platform';
 
   protected readonly metrics: readonly DashboardMetric[] = [
@@ -103,4 +141,10 @@ export class App {
         return 'status status--failed';
     }
   }
+
 }
+
+type BackendConnectionState =
+  | 'loading'
+  | 'online'
+  | 'offline';
