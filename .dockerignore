@@ -1,0 +1,13 @@
+.git
+.gitignore
+
+node_modules
+.angular
+.nginx
+coverage
+
+.idea
+.vscode
+
+*.log
+.DS_Store
