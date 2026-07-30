@@ -16,9 +16,19 @@ pipeline {
     }
 
     stages {
-        stage('Checkout') {
+       stage('Checkout') {
             steps {
-                checkout scm
+                script {
+                    def scmVariables = checkout scm
+
+                    env.GIT_COMMIT_SHA =
+                        scmVariables['GIT_COMMIT'] ?: sh(
+                            script: 'git rev-parse HEAD',
+                            returnStdout: true
+                        ).trim()
+
+                    echo "Commit récupéré : ${env.GIT_COMMIT_SHA}"
+                }
             }
         }
 
@@ -129,21 +139,36 @@ pipeline {
 
                     attempt=1
 
-                    until curl \
-                      -fsS \
-                      "$FRONT_INTERNAL_URL/actuator" \
-                      > frontend-health.json
+                    while true
                     do
+                        HTTP_CODE="$(
+                            curl \
+                            -sS \
+                            --connect-timeout 3 \
+                            --max-time 5 \
+                            -o frontend-health.json \
+                            -w '%{http_code}' \
+                            "$FRONT_INTERNAL_URL/health" ||
+                            true
+                        )"
+
+                        if [ "$HTTP_CODE" = "200" ]; then
+                            break
+                        fi
+
                         if [ "$attempt" -ge 12 ]; then
                             echo "bank-front ne répond pas après 60 secondes."
+                            echo "Dernier code HTTP : $HTTP_CODE"
+
+                            cat frontend-health.json 2>/dev/null || true
                             docker compose ps
-                            docker compose logs \
-                              --tail=100 \
-                              bank-front
+                            docker compose logs --tail=100 bank-front
+
                             exit 1
                         fi
 
-                        echo "Tentative $attempt/12..."
+                        echo "Tentative $attempt/12 — HTTP $HTTP_CODE"
+
                         attempt=$((attempt + 1))
                         sleep 5
                     done
@@ -152,21 +177,44 @@ pipeline {
                     echo "=== Health frontend ==="
                     cat frontend-health.json
 
+                    grep -q '"status":"UP"' frontend-health.json
+                    grep -q '"service":"bank-front"' frontend-health.json
+
                     echo
                     echo "=== Backend via Nginx ==="
-                    curl \
-                      -fsS \
-                      "$FRONT_INTERNAL_URL/actuator/health" \
-                      > backend-health.json
+
+                    BACKEND_HTTP_CODE="$(
+                        curl \
+                        -sS \
+                        --connect-timeout 3 \
+                        --max-time 10 \
+                        -o backend-health.json \
+                        -w '%{http_code}' \
+                        "$FRONT_INTERNAL_URL/actuator/health" ||
+                        true
+                    )"
+
+                    if [ "$BACKEND_HTTP_CODE" != "200" ]; then
+                        echo "Healthcheck backend en échec."
+                        echo "Code HTTP : $BACKEND_HTTP_CODE"
+
+                        cat backend-health.json 2>/dev/null || true
+                        exit 1
+                    fi
 
                     cat backend-health.json
 
+                    grep -q '"status":"UP"' backend-health.json
+
                     echo
                     echo "=== Page Angular ==="
+
                     curl \
-                      -fsS \
-                      "$FRONT_INTERNAL_URL/" |
-                      grep -q '<bank-root'
+                    -fsS \
+                    --connect-timeout 3 \
+                    --max-time 10 \
+                    "$FRONT_INTERNAL_URL/" |
+                    grep -q '<bank-root'
 
                     echo "Composant bank-root détecté"
                     echo
@@ -194,8 +242,8 @@ pipeline {
         }
 
         always {
-            echo "Build Jenkins : ${BUILD_NUMBER}"
-            echo "Commit Git    : ${GIT_COMMIT}"
+            echo "Build Jenkins : ${env.BUILD_NUMBER}"
+            echo "Commit Git    : ${env.GIT_COMMIT_SHA ?: 'inconnu'}"
         }
     }
 }
