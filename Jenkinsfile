@@ -99,6 +99,26 @@ pipeline {
             }
         }
 
+        stage('Unit tests') {
+            steps {
+                timeout(
+                    time: 5,
+                    unit: 'MINUTES'
+                ) {
+                    sh '''
+                        set -eu
+
+                        echo "=== Tests unitaires Angular ==="
+
+                        npm run test:ci
+
+                        echo
+                        echo "Tests unitaires validés"
+                    '''
+                }
+            }
+        }
+
         stage('Build Angular') {
             steps {
                 sh '''
