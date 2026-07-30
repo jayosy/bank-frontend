@@ -63,7 +63,7 @@ export class App implements OnInit{
     });
   }
   
-  protected readonly applicationName = 'Bank Platform';
+  protected readonly applicationName = 'Platform';
 
   protected readonly metrics: readonly DashboardMetric[] = [
     {
