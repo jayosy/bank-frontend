@@ -99,7 +99,7 @@ pipeline {
             }
         }
 
-        stage('Unit tests and coverage') {
+       stage('Unit tests and coverage') {
             steps {
                 timeout(
                     time: 5,
@@ -243,6 +243,131 @@ pipeline {
                 }
             }
         }
+
+        stage('Build Angular') {
+            steps {
+                sh '''
+                    set -eu
+
+                    npm run build:prod
+
+                    test \
+                      -f dist/bank-front/browser/index.html
+
+                    echo "Build Angular validé"
+                '''
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+                    set -eu
+
+                    docker compose up \
+                      -d \
+                      --build \
+                      bank-front
+
+                    docker compose ps \
+                      bank-front
+                '''
+            }
+        }
+
+        stage('Smoke tests') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Attente du démarrage de bank-front..."
+
+                    attempt=1
+
+                    while true
+                    do
+                        HTTP_CODE="$(
+                            curl \
+                            -sS \
+                            --connect-timeout 3 \
+                            --max-time 5 \
+                            -o frontend-health.json \
+                            -w '%{http_code}' \
+                            "$FRONT_INTERNAL_URL/health" ||
+                            true
+                        )"
+
+                        if [ "$HTTP_CODE" = "200" ]; then
+                            break
+                        fi
+
+                        if [ "$attempt" -ge 12 ]; then
+                            echo "bank-front ne répond pas après 60 secondes."
+                            echo "Dernier code HTTP : $HTTP_CODE"
+
+                            cat frontend-health.json 2>/dev/null || true
+                            docker compose ps
+                            docker compose logs --tail=100 bank-front
+
+                            exit 1
+                        fi
+
+                        echo "Tentative $attempt/12 — HTTP $HTTP_CODE"
+
+                        attempt=$((attempt + 1))
+                        sleep 5
+                    done
+
+                    echo
+                    echo "=== Health frontend ==="
+                    cat frontend-health.json
+
+                    grep -q '"status":"UP"' frontend-health.json
+                    grep -q '"service":"bank-front"' frontend-health.json
+
+                    echo
+                    echo "=== Backend via Nginx ==="
+
+                    BACKEND_HTTP_CODE="$(
+                        curl \
+                        -sS \
+                        --connect-timeout 3 \
+                        --max-time 10 \
+                        -o backend-health.json \
+                        -w '%{http_code}' \
+                        "$FRONT_INTERNAL_URL/actuator/health" ||
+                        true
+                    )"
+
+                    if [ "$BACKEND_HTTP_CODE" != "200" ]; then
+                        echo "Healthcheck backend en échec."
+                        echo "Code HTTP : $BACKEND_HTTP_CODE"
+
+                        cat backend-health.json 2>/dev/null || true
+                        exit 1
+                    fi
+
+                    cat backend-health.json
+
+                    grep -q '"status":"UP"' backend-health.json
+
+                    echo
+                    echo "=== Page Angular ==="
+
+                    curl \
+                    -fsS \
+                    --connect-timeout 3 \
+                    --max-time 10 \
+                    "$FRONT_INTERNAL_URL/" |
+                    grep -q '<bank-root'
+
+                    echo "Composant bank-root détecté"
+                    echo
+                    echo "Déploiement frontend validé"
+                '''
+            }
+        }
+    }
 
     post {
         success {
