@@ -78,7 +78,13 @@
               "lcov",
               "json-summary",
               "cobertura"
-            ]
+            ],
+              "coverageThresholds": {
+              "statements": 90,
+              "branches": 85,
+              "functions": 70,
+              "lines": 90
+            }
           }
         }
       }
