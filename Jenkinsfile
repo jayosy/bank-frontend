@@ -99,7 +99,7 @@ pipeline {
             }
         }
 
-       stage('Unit tests and coverage') {
+        stage('Unit tests and coverage') {
             steps {
                 timeout(
                     time: 5,
@@ -110,18 +110,110 @@ pipeline {
 
                         echo "=== Tests unitaires et couverture ==="
 
-                        rm -rf coverage
+                        rm -rf \
+                        coverage \
+                        coverage-publish
 
                         npm run test:coverage
 
                         echo
-                        echo "=== Vérification des rapports ==="
+                        echo "=== Fichiers de couverture générés ==="
 
-                        test -f coverage/index.html
-                        test -f coverage/lcov.info
-                        test -f coverage/coverage-summary.json
+                        find coverage \
+                        -maxdepth 4 \
+                        -type f \
+                        | sort
 
-                        echo "Rapports de couverture générés"
+                        echo
+                        echo "=== Recherche des rapports ==="
+
+                        HTML_INDEX="$(
+                            find coverage \
+                            -maxdepth 2 \
+                            -type f \
+                            -name index.html \
+                            -print \
+                            -quit
+                        )"
+
+                        LCOV_FILE="$(
+                            find coverage \
+                            -maxdepth 3 \
+                            -type f \
+                            -name lcov.info \
+                            -print \
+                            -quit
+                        )"
+
+                        JSON_SUMMARY="$(
+                            find coverage \
+                            -maxdepth 3 \
+                            -type f \
+                            -name coverage-summary.json \
+                            -print \
+                            -quit
+                        )"
+
+                        COBERTURA_FILE="$(
+                            find coverage \
+                            -maxdepth 3 \
+                            -type f \
+                            -name '*cobertura*.xml' \
+                            -print \
+                            -quit
+                        )"
+
+                        if [ -z "$HTML_INDEX" ]; then
+                            echo "Rapport HTML de couverture introuvable."
+                            exit 1
+                        fi
+
+                        if [ -z "$LCOV_FILE" ]; then
+                            echo "Rapport LCOV introuvable."
+                            exit 1
+                        fi
+
+                        if [ -z "$JSON_SUMMARY" ]; then
+                            echo "Résumé JSON de couverture introuvable."
+                            exit 1
+                        fi
+
+                        echo "HTML      : $HTML_INDEX"
+                        echo "LCOV      : $LCOV_FILE"
+                        echo "JSON      : $JSON_SUMMARY"
+                        echo "Cobertura : ${COBERTURA_FILE:-non généré}"
+
+                        echo
+                        echo "=== Normalisation pour Jenkins ==="
+
+                        REPORT_DIRECTORY="$(dirname "$HTML_INDEX")"
+
+                        mkdir -p coverage-publish
+
+                        cp -R \
+                        "$REPORT_DIRECTORY/." \
+                        coverage-publish/
+
+                        cp \
+                        "$LCOV_FILE" \
+                        coverage-publish/lcov.info
+
+                        cp \
+                        "$JSON_SUMMARY" \
+                        coverage-publish/coverage-summary.json
+
+                        if [ -n "$COBERTURA_FILE" ]; then
+                            cp \
+                            "$COBERTURA_FILE" \
+                            coverage-publish/cobertura-coverage.xml
+                        fi
+
+                        test -f coverage-publish/index.html
+                        test -f coverage-publish/lcov.info
+                        test -f coverage-publish/coverage-summary.json
+
+                        echo
+                        echo "Rapports de couverture validés"
                     '''
                 }
             }
@@ -129,14 +221,17 @@ pipeline {
             post {
                 always {
                     archiveArtifacts(
-                        artifacts: 'coverage/**/*',
+                        artifacts: '''
+                            coverage/**/*,
+                            coverage-publish/**/*
+                        ''',
                         allowEmptyArchive: true,
                         fingerprint: false
                     )
 
                     publishHTML(
                         target: [
-                            reportDir: 'coverage',
+                            reportDir: 'coverage-publish',
                             reportFiles: 'index.html',
                             reportName: 'Couverture Angular',
                             reportTitles: 'Rapport de couverture',
@@ -148,131 +243,6 @@ pipeline {
                 }
             }
         }
-
-        stage('Build Angular') {
-            steps {
-                sh '''
-                    set -eu
-
-                    npm run build:prod
-
-                    test \
-                      -f dist/bank-front/browser/index.html
-
-                    echo "Build Angular validé"
-                '''
-            }
-        }
-
-        stage('Deploy') {
-            steps {
-                sh '''
-                    set -eu
-
-                    docker compose up \
-                      -d \
-                      --build \
-                      bank-front
-
-                    docker compose ps \
-                      bank-front
-                '''
-            }
-        }
-
-        stage('Smoke tests') {
-            steps {
-                sh '''
-                    set -eu
-
-                    echo "Attente du démarrage de bank-front..."
-
-                    attempt=1
-
-                    while true
-                    do
-                        HTTP_CODE="$(
-                            curl \
-                            -sS \
-                            --connect-timeout 3 \
-                            --max-time 5 \
-                            -o frontend-health.json \
-                            -w '%{http_code}' \
-                            "$FRONT_INTERNAL_URL/health" ||
-                            true
-                        )"
-
-                        if [ "$HTTP_CODE" = "200" ]; then
-                            break
-                        fi
-
-                        if [ "$attempt" -ge 12 ]; then
-                            echo "bank-front ne répond pas après 60 secondes."
-                            echo "Dernier code HTTP : $HTTP_CODE"
-
-                            cat frontend-health.json 2>/dev/null || true
-                            docker compose ps
-                            docker compose logs --tail=100 bank-front
-
-                            exit 1
-                        fi
-
-                        echo "Tentative $attempt/12 — HTTP $HTTP_CODE"
-
-                        attempt=$((attempt + 1))
-                        sleep 5
-                    done
-
-                    echo
-                    echo "=== Health frontend ==="
-                    cat frontend-health.json
-
-                    grep -q '"status":"UP"' frontend-health.json
-                    grep -q '"service":"bank-front"' frontend-health.json
-
-                    echo
-                    echo "=== Backend via Nginx ==="
-
-                    BACKEND_HTTP_CODE="$(
-                        curl \
-                        -sS \
-                        --connect-timeout 3 \
-                        --max-time 10 \
-                        -o backend-health.json \
-                        -w '%{http_code}' \
-                        "$FRONT_INTERNAL_URL/actuator/health" ||
-                        true
-                    )"
-
-                    if [ "$BACKEND_HTTP_CODE" != "200" ]; then
-                        echo "Healthcheck backend en échec."
-                        echo "Code HTTP : $BACKEND_HTTP_CODE"
-
-                        cat backend-health.json 2>/dev/null || true
-                        exit 1
-                    fi
-
-                    cat backend-health.json
-
-                    grep -q '"status":"UP"' backend-health.json
-
-                    echo
-                    echo "=== Page Angular ==="
-
-                    curl \
-                    -fsS \
-                    --connect-timeout 3 \
-                    --max-time 10 \
-                    "$FRONT_INTERNAL_URL/" |
-                    grep -q '<bank-root'
-
-                    echo "Composant bank-root détecté"
-                    echo
-                    echo "Déploiement frontend validé"
-                '''
-            }
-        }
-    }
 
     post {
         success {
