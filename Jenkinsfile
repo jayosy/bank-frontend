@@ -99,7 +99,7 @@ pipeline {
             }
         }
 
-        stage('Unit tests') {
+       stage('Unit tests and coverage') {
             steps {
                 timeout(
                     time: 5,
@@ -108,13 +108,43 @@ pipeline {
                     sh '''
                         set -eu
 
-                        echo "=== Tests unitaires Angular ==="
+                        echo "=== Tests unitaires et couverture ==="
 
-                        npm run test:ci
+                        rm -rf coverage
+
+                        npm run test:coverage
 
                         echo
-                        echo "Tests unitaires validés"
+                        echo "=== Vérification des rapports ==="
+
+                        test -f coverage/index.html
+                        test -f coverage/lcov.info
+                        test -f coverage/coverage-summary.json
+
+                        echo "Rapports de couverture générés"
                     '''
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'coverage/**/*',
+                        allowEmptyArchive: true,
+                        fingerprint: false
+                    )
+
+                    publishHTML(
+                        target: [
+                            reportDir: 'coverage',
+                            reportFiles: 'index.html',
+                            reportName: 'Couverture Angular',
+                            reportTitles: 'Rapport de couverture',
+                            keepAll: true,
+                            alwaysLinkToLastBuild: true,
+                            allowMissing: true
+                        ]
+                    )
                 }
             }
         }
