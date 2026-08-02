@@ -45,3 +45,6 @@ Thumbs.db
 
 # Local Nginx runtime
 /.nginx/
+
+# SonarQube scanner
+/.scannerwork/

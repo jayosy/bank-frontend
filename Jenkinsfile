@@ -13,6 +13,8 @@ pipeline {
 
     environment {
         FRONT_INTERNAL_URL = 'http://bank-front:8080'
+        SONARQUBE_INSTALLATION = 'sonarqube'
+        SONAR_SCANNER_TOOL = 'sonar-scanner'
     }
 
     stages {
@@ -270,6 +272,66 @@ pipeline {
                             allowMissing: true
                         ]
                     )
+                }
+            }
+        }
+
+        stage('SonarQube analysis') {
+            steps {
+                timeout(
+                    time: 10,
+                    unit: 'MINUTES'
+                ) {
+                    script {
+                        def scannerHome = tool env.SONAR_SCANNER_TOOL
+
+                        withEnv([
+                            "SONAR_SCANNER_HOME=${scannerHome}"
+                        ]) {
+                            withSonarQubeEnv(
+                                installationName: env.SONARQUBE_INSTALLATION,
+                                credentialsId: 'sonarqube-bank-front-token'
+                            ) {
+                                sh '''
+                                    set -eu
+
+                                    echo "=== Préparation SonarQube ==="
+
+                                    rm -rf .scannerwork
+
+                                    test -f sonar-project.properties
+                                    test -f coverage/bank-front/lcov.info
+
+                                    echo
+                                    echo "Serveur SonarQube : $SONAR_HOST_URL"
+
+                                    curl \
+                                    -fsS \
+                                    --connect-timeout 5 \
+                                    --max-time 15 \
+                                    "$SONAR_HOST_URL/api/system/status"
+
+                                    echo
+                                    echo
+                                    echo "=== Version SonarScanner ==="
+
+                                    "$SONAR_SCANNER_HOME/bin/sonar-scanner" \
+                                    --version
+
+                                    echo
+                                    echo "=== Analyse SonarQube ==="
+
+                                    "$SONAR_SCANNER_HOME/bin/sonar-scanner"
+
+                                    test \
+                                    -f .scannerwork/report-task.txt
+
+                                    echo
+                                    echo "Analyse SonarQube envoyée"
+                                '''
+                            }
+                        }
+                    }
                 }
             }
         }

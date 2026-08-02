@@ -12,7 +12,8 @@ module.exports = defineConfig([
       'coverage-publish/**',
       'dist/**',
       '.angular/**',
-      '.nginx/**'
+      '.nginx/**',
+      '.scannerwork/**'
     ]
   },
   {
