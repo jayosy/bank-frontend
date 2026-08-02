@@ -336,6 +336,31 @@ pipeline {
             }
         }
 
+        stage('Quality Gate') {
+            steps {
+                timeout(
+                    time: 10,
+                    unit: 'MINUTES'
+                ) {
+                    script {
+                        def qualityGate = waitForQualityGate(
+                            abortPipeline: false,
+                            webhookSecretId: 'sonarqube-webhook-secret'
+                        )
+
+                        echo "Quality Gate SonarQube : ${qualityGate.status}"
+
+                        if (qualityGate.status != 'OK') {
+                            error(
+                                "Quality Gate SonarQube non validé : " +
+                                qualityGate.status
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         stage('Build Angular') {
             steps {
                 sh '''
