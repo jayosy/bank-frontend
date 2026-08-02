@@ -99,6 +99,36 @@ pipeline {
             }
         }
 
+        stage('Lint') {
+            steps {
+                timeout(
+                    time: 5,
+                    unit: 'MINUTES'
+                ) {
+                    sh '''
+                        set -eu
+
+                        echo "=== Nettoyage des artefacts précédents ==="
+
+                        rm -rf \
+                        coverage \
+                        coverage-publish \
+                        dist \
+                        .angular/cache
+
+                        echo
+
+                        echo "=== Analyse ESLint ==="
+
+                        npm run lint:ci
+
+                        echo
+                        echo "ESLint validé"
+                    '''
+                }
+            }
+        }
+
        stage('Unit tests and coverage') {
             steps {
                 timeout(
