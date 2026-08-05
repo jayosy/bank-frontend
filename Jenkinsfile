@@ -17,7 +17,7 @@ pipeline {
         SONAR_SCANNER_TOOL = 'sonar-scanner'
 
         NEXUS_DOCKER_REGISTRY = 'localhost:8084'
-        NEXUS_DOCKER_REGISTRY_INTERNAL = 'nexus:8084'
+        NEXUS_DOCKER_API_URL  = 'http://host.docker.internal:8084'
         IMAGE_REPOSITORY      = 'localhost:8084/bank-front'
     }
 
@@ -640,8 +640,11 @@ pipeline {
                             rm -rf \
                             "$DOCKER_CONFIG" \
                             published-manifest.json \
+                            published-manifest.headers \
                             release-manifest.json \
+                            release-manifest.headers \
                             existing-release-manifest.json \
+                            existing-release-manifest.headers \
                             published-image.properties
 
                             mkdir -p "$DOCKER_CONFIG"
@@ -653,26 +656,162 @@ pipeline {
                             trap cleanup EXIT HUP INT TERM
 
                             echo "=== Connexion au registry Nexus ==="
+                            echo "Registry Docker : $NEXUS_DOCKER_REGISTRY"
+                            echo "API Nexus       : $NEXUS_DOCKER_API_URL"
 
                             set +x
 
-                            printf '%s' "$NEXUS_DOCKER_PASSWORD" |
-                            docker login \
+                            if ! printf '%s' "$NEXUS_DOCKER_PASSWORD" |
+                                docker login \
                                 "$NEXUS_DOCKER_REGISTRY" \
                                 --username "$NEXUS_DOCKER_USERNAME" \
                                 --password-stdin \
                                 >/dev/null
-
-                            printf '%s' "$NEXUS_DOCKER_PASSWORD" |
-                            docker login \
-                                "$NEXUS_DOCKER_REGISTRY_INTERNAL" \
-                                --username "$NEXUS_DOCKER_USERNAME" \
-                                --password-stdin \
-                                >/dev/null
+                            then
+                                set -x
+                                echo "Échec de la connexion au registry Nexus."
+                                exit 1
+                            fi
 
                             set -x
 
                             echo "Connexion Nexus validée"
+
+                            fetch_manifest_digest() {
+                                IMAGE_REFERENCE="$1"
+                                MANIFEST_FILE="$2"
+                                HEADERS_FILE="$3"
+
+                                IMAGE_WITH_TAG="${
+                                    IMAGE_REFERENCE#${NEXUS_DOCKER_REGISTRY}/
+                                }"
+
+                                REPOSITORY_NAME="${IMAGE_WITH_TAG%:*}"
+                                TAG_VALUE="${IMAGE_WITH_TAG##*:}"
+
+                                MANIFEST_URL="${
+                                    NEXUS_DOCKER_API_URL
+                                }/v2/${
+                                    REPOSITORY_NAME
+                                }/manifests/${
+                                    TAG_VALUE
+                                }"
+
+                                rm -f \
+                                "$MANIFEST_FILE" \
+                                "$HEADERS_FILE"
+
+                                echo "Manifest API : $MANIFEST_URL" >&2
+
+                                set +e
+                                set +x
+
+                                HTTP_CODE="$(
+                                    curl \
+                                    --silent \
+                                    --show-error \
+                                    --connect-timeout 5 \
+                                    --max-time 30 \
+                                    --retry 4 \
+                                    --retry-delay 1 \
+                                    --retry-connrefused \
+                                    --user "$NEXUS_DOCKER_USERNAME:$NEXUS_DOCKER_PASSWORD" \
+                                    --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+                                    --dump-header "$HEADERS_FILE" \
+                                    --output "$MANIFEST_FILE" \
+                                    --write-out '%{http_code}' \
+                                    "$MANIFEST_URL"
+                                )"
+
+                                CURL_STATUS="$?"
+
+                                set -x
+                                set -e
+
+                                if [ "$CURL_STATUS" -ne 0 ]; then
+                                    echo \
+                                    "Erreur réseau pendant la lecture du manifest." \
+                                    >&2
+
+                                    return 1
+                                fi
+
+                                case "$HTTP_CODE" in
+                                    200)
+                                        ;;
+
+                                    404)
+                                        echo \
+                                        "Manifest absent : $IMAGE_REFERENCE" \
+                                        >&2
+
+                                        return 44
+                                        ;;
+
+                                    *)
+                                        echo \
+                                        "Réponse Nexus inattendue : HTTP $HTTP_CODE" \
+                                        >&2
+
+                                        cat "$MANIFEST_FILE" >&2 || true
+                                        return 1
+                                        ;;
+                                esac
+
+                                DIGEST="$(
+                                    node -e '
+                                        const fs = require("node:fs");
+
+                                        const lines = fs
+                                        .readFileSync(
+                                            process.argv[1],
+                                            "utf8"
+                                        )
+                                        .split(
+                                            String.fromCharCode(10)
+                                        );
+
+                                        const line = lines.find(
+                                        (value) =>
+                                            value
+                                            .toLowerCase()
+                                            .startsWith(
+                                                "docker-content-digest:"
+                                            )
+                                        );
+
+                                        if (!line) {
+                                        process.exit(2);
+                                        }
+
+                                        const digest = line
+                                        .slice(
+                                            line.indexOf(":") + 1
+                                        )
+                                        .replaceAll(
+                                            String.fromCharCode(13),
+                                            ""
+                                        )
+                                        .trim();
+
+                                        process.stdout.write(digest);
+                                    ' "$HEADERS_FILE"
+                                )"
+
+                                if ! printf '%s' "$DIGEST" |
+                                    grep \
+                                    -Eq \
+                                    '^sha256:[0-9a-f]{64}$'
+                                then
+                                    echo \
+                                    "Digest Nexus invalide : $DIGEST" \
+                                    >&2
+
+                                    return 1
+                                fi
+
+                                printf '%s' "$DIGEST"
+                            }
 
                             echo
                             echo "=== Publication du tag CI ==="
@@ -682,49 +821,13 @@ pipeline {
 
                             echo
                             echo "=== Vérification du manifest distant ==="
-                            INTERNAL_IMAGE_REF="${NEXUS_DOCKER_REGISTRY_INTERNAL}/${IMAGE_REF#${NEXUS_DOCKER_REGISTRY}/}"
-
-                            echo "Référence push     : $IMAGE_REF"
-                            echo "Référence inspect  : $INTERNAL_IMAGE_REF"
-                            docker manifest inspect \
-                            --insecure \
-                            --verbose \
-                            "$INTERNAL_IMAGE_REF" \
-                            > published-manifest.json
-
-                            manifest_digest() {
-                                node -e '
-                                    const fs = require("node:fs");
-
-                                    const manifest = JSON.parse(
-                                    fs.readFileSync(
-                                        process.argv[1],
-                                        "utf8"
-                                    )
-                                    );
-
-                                    const digest =
-                                    manifest.Descriptor?.digest ??
-                                    manifest.Digest ??
-                                    manifest.digest ??
-                                    "";
-
-                                    if (!digest.startsWith("sha256:")) {
-                                    throw new Error(
-                                        "Digest distant introuvable"
-                                    );
-                                    }
-
-                                    process.stdout.write(digest);
-                                ' "$1"
-                            }
 
                             REMOTE_DIGEST="$(
-                                manifest_digest \
-                                published-manifest.json
+                                fetch_manifest_digest \
+                                "$IMAGE_REF" \
+                                published-manifest.json \
+                                published-manifest.headers
                             )"
-
-                            test -n "$REMOTE_DIGEST"
 
                             echo "Digest Nexus : $REMOTE_DIGEST"
 
@@ -733,36 +836,45 @@ pipeline {
                             if [ -n "${RELEASE_GIT_TAG:-}" ]; then
                                 echo
                                 echo "=== Publication de la release ==="
-                                INTERNAL_RELEASE_IMAGE_REF="${NEXUS_DOCKER_REGISTRY_INTERNAL}/${RELEASE_IMAGE_REF#${NEXUS_DOCKER_REGISTRY}/}"
-                                
-                                echo "Tag Git      : $RELEASE_GIT_TAG"
-                                echo "Image release: $RELEASE_IMAGE_REF"
-                                echo "Référence interne: $INTERNAL_RELEASE_IMAGE_REF"
+                                echo "Tag Git       : $RELEASE_GIT_TAG"
+                                echo "Image release : $RELEASE_IMAGE_REF"
 
-                                if docker manifest inspect \
-                                    --insecure \
-                                    --verbose \
-                                    "$INTERNAL_RELEASE_IMAGE_REF" \
-                                    > existing-release-manifest.json \
-                                    2>/dev/null
+                                if EXISTING_RELEASE_DIGEST="$(
+                                    fetch_manifest_digest \
+                                    "$RELEASE_IMAGE_REF" \
+                                    existing-release-manifest.json \
+                                    existing-release-manifest.headers
+                                )"
                                 then
-                                    EXISTING_RELEASE_DIGEST="$(
-                                        manifest_digest \
-                                        existing-release-manifest.json
-                                    )"
-
-                                    if [ "$EXISTING_RELEASE_DIGEST" != "$REMOTE_DIGEST" ]; then
+                                    if [
+                                        "$EXISTING_RELEASE_DIGEST" !=
+                                        "$REMOTE_DIGEST"
+                                    ]; then
                                         echo "Conflit de release immuable."
-                                        echo "Tag        : $RELEASE_IMAGE_REF"
-                                        echo "Nexus      : $EXISTING_RELEASE_DIGEST"
-                                        echo "Build actuel: $REMOTE_DIGEST"
+                                        echo \
+                                        "Tag          : $RELEASE_IMAGE_REF"
+                                        echo \
+                                        "Digest Nexus : $EXISTING_RELEASE_DIGEST"
+                                        echo \
+                                        "Digest build : $REMOTE_DIGEST"
+
                                         exit 1
                                     fi
 
                                     RELEASE_DIGEST="$EXISTING_RELEASE_DIGEST"
 
-                                    echo "La release existe déjà avec le bon digest."
+                                    echo \
+                                    "La release existe déjà avec le bon digest."
                                 else
+                                    FETCH_STATUS="$?"
+
+                                    if [ "$FETCH_STATUS" -ne 44 ]; then
+                                        echo \
+                                        "Impossible de vérifier la release existante."
+
+                                        exit "$FETCH_STATUS"
+                                    fi
+
                                     docker image tag \
                                     "$IMAGE_REF" \
                                     "$RELEASE_IMAGE_REF"
@@ -770,25 +882,28 @@ pipeline {
                                     docker push \
                                     "$RELEASE_IMAGE_REF"
 
-                                    docker manifest inspect \
-                                    --insecure \
-                                    --verbose \
-                                    "$INTERNAL_RELEASE_IMAGE_REF" \
-                                    > release-manifest.json
-
                                     RELEASE_DIGEST="$(
-                                        manifest_digest \
-                                        release-manifest.json
+                                        fetch_manifest_digest \
+                                        "$RELEASE_IMAGE_REF" \
+                                        release-manifest.json \
+                                        release-manifest.headers
                                     )"
 
-                                    if [ "$RELEASE_DIGEST" != "$REMOTE_DIGEST" ]; then
+                                    if [
+                                        "$RELEASE_DIGEST" !=
+                                        "$REMOTE_DIGEST"
+                                    ]; then
                                         echo "Digest de release incohérent."
-                                        echo "Tag CI   : $REMOTE_DIGEST"
-                                        echo "Release  : $RELEASE_DIGEST"
+                                        echo \
+                                        "Tag CI  : $REMOTE_DIGEST"
+                                        echo \
+                                        "Release : $RELEASE_DIGEST"
+
                                         exit 1
                                     fi
 
-                                    echo "Release publiée : $RELEASE_IMAGE_REF"
+                                    echo \
+                                    "Release publiée : $RELEASE_IMAGE_REF"
                                 fi
                             else
                                 echo
