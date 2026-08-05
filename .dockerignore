@@ -4,10 +4,16 @@
 node_modules
 .angular
 .nginx
-coverage
 
 .idea
 .vscode
 
 *.log
 .DS_Store
+
+# CI reports and metadata
+coverage
+coverage-publish
+.scannerwork
+build-metadata.properties
+deployed-version.json

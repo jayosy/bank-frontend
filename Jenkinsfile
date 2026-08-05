@@ -15,6 +15,8 @@ pipeline {
         FRONT_INTERNAL_URL = 'http://bank-front:8080'
         SONARQUBE_INSTALLATION = 'sonarqube'
         SONAR_SCANNER_TOOL = 'sonar-scanner'
+
+        IMAGE_REPOSITORY = 'bank-front'
     }
 
     stages {
@@ -87,6 +89,116 @@ pipeline {
                     echo "=== Backend depuis Jenkins ==="
                     curl -fsS \
                       http://bank-api:8080/api/health
+                '''
+            }
+        }
+
+        stage('Version metadata') {
+            steps {
+                script {
+                    env.APP_VERSION = sh(
+                        script: '''
+                            node -p "require('./package.json').version"
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    sh '''
+                        set -eu
+
+                        node <<'NODE'
+                        const pkg = require('./package.json');
+                        const lock = require('./package-lock.json');
+
+                        const version = pkg.version;
+                        const lockRootVersion =
+                        lock.packages?.['']?.version ?? lock.version;
+
+                        const semverPattern =
+                        /^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$/;
+
+                        if (!semverPattern.test(version)) {
+                        throw new Error(
+                            `Version SemVer invalide : ${version}`
+                        );
+                        }
+
+                        if (version.includes('+')) {
+                        throw new Error(
+                            'Les métadonnées SemVer avec + ne sont pas utilisées ' +
+                            'dans les tags Docker de ce projet.'
+                        );
+                        }
+
+                        if (lock.version !== version) {
+                        throw new Error(
+                            `package-lock version ${lock.version} != ${version}`
+                        );
+                        }
+
+                        if (lockRootVersion !== version) {
+                        throw new Error(
+                            `package-lock root ${lockRootVersion} != ${version}`
+                        );
+                        }
+
+                        console.log(`Version validée : ${version}`);
+                        NODE
+                    '''
+
+                    env.GIT_SHORT_SHA = sh(
+                        script: 'git rev-parse --short=12 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.BUILD_DATE = sh(
+                        script: "date -u +'%Y-%m-%dT%H:%M:%SZ'",
+                        returnStdout: true
+                    ).trim()
+
+                    env.IMAGE_TAG =
+                        "${env.APP_VERSION}" +
+                        "-b${env.BUILD_NUMBER}" +
+                        "-${env.GIT_SHORT_SHA}"
+
+                    env.IMAGE_REF =
+                        "${env.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"
+
+                    env.RELEASE_GIT_TAG = sh(
+                        script: """
+                            git tag \
+                            --points-at HEAD \
+                            --list 'v${env.APP_VERSION}'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    env.RELEASE_IMAGE_REF =
+                        env.RELEASE_GIT_TAG
+                            ? "${env.IMAGE_REPOSITORY}:${env.APP_VERSION}"
+                            : ''
+
+                    currentBuild.displayName =
+                        "#${env.BUILD_NUMBER} ${env.IMAGE_TAG}"
+                }
+
+                sh '''
+                    set -eu
+
+                    cat > build-metadata.properties <<EOF
+        application=bank-front
+        version=$APP_VERSION
+        gitCommit=$GIT_COMMIT_SHA
+        gitShortSha=$GIT_SHORT_SHA
+        gitTag=${RELEASE_GIT_TAG:-}
+        buildNumber=$BUILD_NUMBER
+        buildDate=$BUILD_DATE
+        image=$IMAGE_REF
+        releaseImage=${RELEASE_IMAGE_REF:-}
+        EOF
+
+                    echo "=== Métadonnées du build ==="
+                    cat build-metadata.properties
                 '''
             }
         }
@@ -369,9 +481,52 @@ pipeline {
                     npm run build:prod
 
                     test \
-                      -f dist/bank-front/browser/index.html
+                    -f dist/bank-front/browser/index.html
 
-                    echo "Build Angular validé"
+                    echo "=== Génération de version.json ==="
+
+                    node <<'NODE'
+                    const fs = require('node:fs');
+
+                    const versionMetadata = {
+                    application: 'bank-front',
+                    version: process.env.APP_VERSION,
+                    image: process.env.IMAGE_REF,
+                    gitCommit: process.env.GIT_COMMIT_SHA,
+                    gitShortSha: process.env.GIT_SHORT_SHA,
+                    gitTag: process.env.RELEASE_GIT_TAG || null,
+                    buildNumber: Number(process.env.BUILD_NUMBER),
+                    buildDate: process.env.BUILD_DATE
+                    };
+
+                    const target =
+                    'dist/bank-front/browser/version.json';
+
+                    fs.writeFileSync(
+                    target,
+                    JSON.stringify(versionMetadata, null, 2) + '\\n',
+                    'utf8'
+                    );
+
+                    console.log(`Fichier généré : ${target}`);
+                    NODE
+
+                    test \
+                    -f dist/bank-front/browser/version.json
+
+                    node -e "
+                    JSON.parse(
+                        require('node:fs').readFileSync(
+                        'dist/bank-front/browser/version.json',
+                        'utf8'
+                        )
+                    )
+                    "
+
+                    cat dist/bank-front/browser/version.json
+
+                    echo
+                    echo "Build Angular versionné et validé"
                 '''
             }
         }
@@ -381,13 +536,126 @@ pipeline {
                 sh '''
                     set -eu
 
+                    echo "=== Image attendue ==="
+                    echo "$IMAGE_REF"
+
+                    echo
+                    echo "=== Configuration Compose résolue ==="
+
+                    docker compose config >/dev/null
+
+                    RESOLVED_IMAGE="$(
+                        docker compose config --images |
+                        head -n 1
+                    )"
+
+                    echo "Image Compose : $RESOLVED_IMAGE"
+
+                    if [ "$RESOLVED_IMAGE" != "$IMAGE_REF" ]; then
+                        echo "Image Compose incorrecte."
+                        echo "Attendue : $IMAGE_REF"
+                        echo "Résolue  : $RESOLVED_IMAGE"
+                        exit 1
+                    fi
+
+                    echo
+                    echo "=== Construction de l’image versionnée ==="
+
+                    docker compose build \
+                    bank-front
+
+                    docker image inspect \
+                    "$IMAGE_REF" \
+                    >/dev/null
+
+                    echo
+                    echo "=== Vérification des labels OCI ==="
+
+                    IMAGE_VERSION="$(
+                        docker image inspect \
+                        --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+                        "$IMAGE_REF"
+                    )"
+
+                    IMAGE_REVISION="$(
+                        docker image inspect \
+                        --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                        "$IMAGE_REF"
+                    )"
+
+                    IMAGE_CREATED="$(
+                        docker image inspect \
+                        --format '{{ index .Config.Labels "org.opencontainers.image.created" }}' \
+                        "$IMAGE_REF"
+                    )"
+
+                    echo "Version  : $IMAGE_VERSION"
+                    echo "Revision : $IMAGE_REVISION"
+                    echo "Création : $IMAGE_CREATED"
+
+                    test "$IMAGE_VERSION" = "$APP_VERSION"
+                    test "$IMAGE_REVISION" = "$GIT_COMMIT_SHA"
+                    test "$IMAGE_CREATED" = "$BUILD_DATE"
+
+                    if [ -n "${RELEASE_GIT_TAG:-}" ]; then
+                        echo
+                        echo "=== Tag de release détecté ==="
+                        echo "$RELEASE_GIT_TAG"
+
+                        docker image tag \
+                        "$IMAGE_REF" \
+                        "$RELEASE_IMAGE_REF"
+
+                        docker image inspect \
+                        "$RELEASE_IMAGE_REF" \
+                        >/dev/null
+
+                        echo "Alias release créé : $RELEASE_IMAGE_REF"
+                    else
+                        echo
+                        echo "Aucun tag Git de release sur ce commit."
+                    fi
+
+                    echo
+                    echo "=== Déploiement ==="
+
                     docker compose up \
-                      -d \
-                      --build \
-                      bank-front
+                    -d \
+                    --no-build \
+                    bank-front
 
                     docker compose ps \
-                      bank-front
+                    bank-front
+
+                    CONTAINER_ID="$(
+                        docker compose ps \
+                        -q \
+                        bank-front
+                    )"
+
+                    test -n "$CONTAINER_ID"
+
+                    RUNNING_IMAGE_ID="$(
+                        docker inspect \
+                        --format '{{.Image}}' \
+                        "$CONTAINER_ID"
+                    )"
+
+                    EXPECTED_IMAGE_ID="$(
+                        docker image inspect \
+                        --format '{{.Id}}' \
+                        "$IMAGE_REF"
+                    )"
+
+                    if [ "$RUNNING_IMAGE_ID" != "$EXPECTED_IMAGE_ID" ]; then
+                        echo "Le conteneur n’utilise pas l’image attendue."
+                        echo "Image active   : $RUNNING_IMAGE_ID"
+                        echo "Image attendue : $EXPECTED_IMAGE_ID"
+                        exit 1
+                    fi
+
+                    echo
+                    echo "Image déployée : $IMAGE_REF"
                 '''
             }
         }
@@ -481,6 +749,58 @@ pipeline {
                     echo "Composant bank-root détecté"
                     echo
                     echo "Déploiement frontend validé"
+
+                    set -eu
+
+                    echo "=== Version déployée ==="
+
+                    curl \
+                    -fsS \
+                    --connect-timeout 3 \
+                    --max-time 10 \
+                    "$FRONT_INTERNAL_URL/version.json" \
+                    > deployed-version.json
+
+                    cat deployed-version.json
+
+                    node <<'NODE'
+                    const fs = require('node:fs');
+
+                    const deployed = JSON.parse(
+                    fs.readFileSync(
+                        'deployed-version.json',
+                        'utf8'
+                    )
+                    );
+
+                    const expected = {
+                    application: 'bank-front',
+                    version: process.env.APP_VERSION,
+                    image: process.env.IMAGE_REF,
+                    gitCommit: process.env.GIT_COMMIT_SHA,
+                    gitShortSha: process.env.GIT_SHORT_SHA,
+                    buildNumber: Number(process.env.BUILD_NUMBER),
+                    buildDate: process.env.BUILD_DATE
+                    };
+
+                    for (const [key, expectedValue] of Object.entries(expected)) {
+                    const actualValue = deployed[key];
+
+                    if (actualValue !== expectedValue) {
+                        throw new Error(
+                        `${key}: attendu=${expectedValue}, obtenu=${actualValue}`
+                        );
+                    }
+                    }
+
+                    console.log(
+                    `Version déployée validée : ${deployed.version}`
+                    );
+
+                    console.log(
+                    `Image déployée validée : ${deployed.image}`
+                    );
+                    NODE
                 '''
             }
         }
@@ -498,13 +818,24 @@ pipeline {
                 docker compose ps || true
 
                 docker compose logs \
-                  --tail=150 \
-                  bank-front || true
+                --tail=150 \
+                bank-front || true
             '''
         }
 
         always {
+            archiveArtifacts(
+                artifacts: '''
+                    build-metadata.properties,
+                    deployed-version.json
+                ''',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+
             echo "Build Jenkins : ${env.BUILD_NUMBER}"
+            echo "Version       : ${env.APP_VERSION ?: 'inconnue'}"
+            echo "Image         : ${env.IMAGE_REF ?: 'inconnue'}"
             echo "Commit Git    : ${env.GIT_COMMIT_SHA ?: 'inconnu'}"
         }
     }
