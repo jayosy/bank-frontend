@@ -17,6 +17,7 @@ pipeline {
         SONAR_SCANNER_TOOL = 'sonar-scanner'
 
         NEXUS_DOCKER_REGISTRY = 'localhost:8084'
+        NEXUS_DOCKER_REGISTRY_INTERNAL = 'nexus:8084'
         IMAGE_REPOSITORY      = 'localhost:8084/bank-front'
     }
 
@@ -662,6 +663,13 @@ pipeline {
                                 --password-stdin \
                                 >/dev/null
 
+                            printf '%s' "$NEXUS_DOCKER_PASSWORD" |
+                            docker login \
+                                "$NEXUS_DOCKER_REGISTRY_INTERNAL" \
+                                --username "$NEXUS_DOCKER_USERNAME" \
+                                --password-stdin \
+                                >/dev/null
+
                             set -x
 
                             echo "Connexion Nexus validée"
@@ -674,11 +682,14 @@ pipeline {
 
                             echo
                             echo "=== Vérification du manifest distant ==="
+                            INTERNAL_IMAGE_REF="${NEXUS_DOCKER_REGISTRY_INTERNAL}/${IMAGE_REF#${NEXUS_DOCKER_REGISTRY}/}"
 
+                            echo "Référence push     : $IMAGE_REF"
+                            echo "Référence inspect  : $INTERNAL_IMAGE_REF"
                             docker manifest inspect \
                             --insecure \
                             --verbose \
-                            "$IMAGE_REF" \
+                            "$INTERNAL_IMAGE_REF" \
                             > published-manifest.json
 
                             manifest_digest() {
@@ -722,13 +733,16 @@ pipeline {
                             if [ -n "${RELEASE_GIT_TAG:-}" ]; then
                                 echo
                                 echo "=== Publication de la release ==="
+                                INTERNAL_RELEASE_IMAGE_REF="${NEXUS_DOCKER_REGISTRY_INTERNAL}/${RELEASE_IMAGE_REF#${NEXUS_DOCKER_REGISTRY}/}"
+                                
                                 echo "Tag Git      : $RELEASE_GIT_TAG"
                                 echo "Image release: $RELEASE_IMAGE_REF"
+                                echo "Référence interne: $INTERNAL_RELEASE_IMAGE_REF"
 
                                 if docker manifest inspect \
                                     --insecure \
                                     --verbose \
-                                    "$RELEASE_IMAGE_REF" \
+                                    "$INTERNAL_RELEASE_IMAGE_REF" \
                                     > existing-release-manifest.json \
                                     2>/dev/null
                                 then
@@ -759,7 +773,7 @@ pipeline {
                                     docker manifest inspect \
                                     --insecure \
                                     --verbose \
-                                    "$RELEASE_IMAGE_REF" \
+                                    "$INTERNAL_RELEASE_IMAGE_REF" \
                                     > release-manifest.json
 
                                     RELEASE_DIGEST="$(
