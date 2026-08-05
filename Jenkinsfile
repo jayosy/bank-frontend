@@ -189,15 +189,15 @@ pipeline {
                     writeFile(
                         file: 'build-metadata.properties',
                         text: """application=bank-front
-        version=${env.APP_VERSION}
-        gitCommit=${env.GIT_COMMIT_SHA}
-        gitShortSha=${env.GIT_SHORT_SHA}
-        gitTag=${env.RELEASE_GIT_TAG}
-        buildNumber=${env.BUILD_NUMBER}
-        buildDate=${env.BUILD_DATE}
-        image=${env.IMAGE_REF}
-        releaseImage=${env.RELEASE_IMAGE_REF}
-        """
+                    version=${env.APP_VERSION}
+                    gitCommit=${env.GIT_COMMIT_SHA}
+                    gitShortSha=${env.GIT_SHORT_SHA}
+                    gitTag=${env.RELEASE_GIT_TAG}
+                    buildNumber=${env.BUILD_NUMBER}
+                    buildDate=${env.BUILD_DATE}
+                    image=${env.IMAGE_REF}
+                    releaseImage=${env.RELEASE_IMAGE_REF}
+                    """
                     )
                 }
 
@@ -770,8 +770,14 @@ pipeline {
                                         const fs = require("node:fs");
 
                                         const lines = fs
-                                        .readFileSync(process.argv[1], "utf8")
-                                        .split(/\r?\n/);
+                                            .readFileSync(process.argv[1], "utf8")
+                                            .split(String.fromCharCode(10))
+                                            .map((line) =>
+                                                line.replaceAll(
+                                                String.fromCharCode(13),
+                                                ""
+                                                )
+                                            );
 
                                         const digestHeader = lines.find(
                                         (line) =>
@@ -838,10 +844,7 @@ pipeline {
                                     existing-release-manifest.headers
                                 )"
                                 then
-                                    if [
-                                        "$EXISTING_RELEASE_DIGEST" !=
-                                        "$REMOTE_DIGEST"
-                                    ]; then
+                                    if ["$EXISTING_RELEASE_DIGEST" !="$REMOTE_DIGEST"]; then
                                         echo "Conflit de release immuable."
                                         echo \
                                         "Tag          : $RELEASE_IMAGE_REF"
@@ -881,10 +884,7 @@ pipeline {
                                         release-manifest.headers
                                     )"
 
-                                    if [
-                                        "$RELEASE_DIGEST" !=
-                                        "$REMOTE_DIGEST"
-                                    ]; then
+                                    if ["$RELEASE_DIGEST" !="$REMOTE_DIGEST"]; then
                                         echo "Digest de release incohérent."
                                         echo \
                                         "Tag CI  : $REMOTE_DIGEST"
