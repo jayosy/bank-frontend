@@ -103,48 +103,47 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    sh '''
-                        set -eu
+                    def lockVersion = sh(
+                        script: '''
+                            node -p "require('./package-lock.json').version"
+                        ''',
+                        returnStdout: true
+                    ).trim()
 
-                        node <<'NODE'
-                        const pkg = require('./package.json');
-                        const lock = require('./package-lock.json');
+                    def lockRootVersion = sh(
+                        script: '''
+                            node -p "
+                                const lock = require('./package-lock.json');
+                                lock.packages?.['']?.version ?? lock.version
+                            "
+                        ''',
+                        returnStdout: true
+                    ).trim()
 
-                        const version = pkg.version;
-                        const lockRootVersion =
-                        lock.packages?.['']?.version ?? lock.version;
+                    def semverPattern =
+                        /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
 
-                        const semverPattern =
-                        /^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$/;
+                    if (!(env.APP_VERSION ==~ semverPattern)) {
+                        error(
+                            "Version SemVer invalide : ${env.APP_VERSION}"
+                        )
+                    }
 
-                        if (!semverPattern.test(version)) {
-                        throw new Error(
-                            `Version SemVer invalide : ${version}`
-                        );
-                        }
+                    if (lockVersion != env.APP_VERSION) {
+                        error(
+                            "package-lock.json=${lockVersion}, " +
+                            "package.json=${env.APP_VERSION}"
+                        )
+                    }
 
-                        if (version.includes('+')) {
-                        throw new Error(
-                            'Les métadonnées SemVer avec + ne sont pas utilisées ' +
-                            'dans les tags Docker de ce projet.'
-                        );
-                        }
+                    if (lockRootVersion != env.APP_VERSION) {
+                        error(
+                            "package-lock root=${lockRootVersion}, " +
+                            "package.json=${env.APP_VERSION}"
+                        )
+                    }
 
-                        if (lock.version !== version) {
-                        throw new Error(
-                            `package-lock version ${lock.version} != ${version}`
-                        );
-                        }
-
-                        if (lockRootVersion !== version) {
-                        throw new Error(
-                            `package-lock root ${lockRootVersion} != ${version}`
-                        );
-                        }
-
-                        console.log(`Version validée : ${version}`);
-                        NODE
-                    '''
+                    echo "Version validée : ${env.APP_VERSION}"
 
                     env.GIT_SHORT_SHA = sh(
                         script: 'git rev-parse --short=12 HEAD',
@@ -168,7 +167,8 @@ pipeline {
                         script: """
                             git tag \
                             --points-at HEAD \
-                            --list 'v${env.APP_VERSION}'
+                            --list 'v${env.APP_VERSION}' |
+                            head -n 1
                         """,
                         returnStdout: true
                     ).trim()
@@ -180,22 +180,26 @@ pipeline {
 
                     currentBuild.displayName =
                         "#${env.BUILD_NUMBER} ${env.IMAGE_TAG}"
+
+                    writeFile(
+                        file: 'build-metadata.properties',
+                        text: """application=bank-front
+        version=${env.APP_VERSION}
+        gitCommit=${env.GIT_COMMIT_SHA}
+        gitShortSha=${env.GIT_SHORT_SHA}
+        gitTag=${env.RELEASE_GIT_TAG}
+        buildNumber=${env.BUILD_NUMBER}
+        buildDate=${env.BUILD_DATE}
+        image=${env.IMAGE_REF}
+        releaseImage=${env.RELEASE_IMAGE_REF}
+        """
+                    )
                 }
 
                 sh '''
                     set -eu
 
-                    cat > build-metadata.properties <<EOF
-        application=bank-front
-        version=$APP_VERSION
-        gitCommit=$GIT_COMMIT_SHA
-        gitShortSha=$GIT_SHORT_SHA
-        gitTag=${RELEASE_GIT_TAG:-}
-        buildNumber=$BUILD_NUMBER
-        buildDate=$BUILD_DATE
-        image=$IMAGE_REF
-        releaseImage=${RELEASE_IMAGE_REF:-}
-        EOF
+                    test -s build-metadata.properties
 
                     echo "=== Métadonnées du build ==="
                     cat build-metadata.properties
@@ -483,47 +487,54 @@ pipeline {
                     test \
                     -f dist/bank-front/browser/index.html
 
-                    echo "=== Génération de version.json ==="
+                    echo "Build Angular validé"
+                '''
 
-                    node <<'NODE'
-                    const fs = require('node:fs');
+                script {
+                    def gitTagJson = env.RELEASE_GIT_TAG
+                        ? "\"${env.RELEASE_GIT_TAG}\""
+                        : 'null'
 
-                    const versionMetadata = {
-                    application: 'bank-front',
-                    version: process.env.APP_VERSION,
-                    image: process.env.IMAGE_REF,
-                    gitCommit: process.env.GIT_COMMIT_SHA,
-                    gitShortSha: process.env.GIT_SHORT_SHA,
-                    gitTag: process.env.RELEASE_GIT_TAG || null,
-                    buildNumber: Number(process.env.BUILD_NUMBER),
-                    buildDate: process.env.BUILD_DATE
-                    };
+                    writeFile(
+                        file: 'dist/bank-front/browser/version.json',
+                        text: """{
+        "application": "bank-front",
+        "version": "${env.APP_VERSION}",
+        "image": "${env.IMAGE_REF}",
+        "gitCommit": "${env.GIT_COMMIT_SHA}",
+        "gitShortSha": "${env.GIT_SHORT_SHA}",
+        "gitTag": ${gitTagJson},
+        "buildNumber": ${env.BUILD_NUMBER},
+        "buildDate": "${env.BUILD_DATE}"
+        }
+        """
+                    )
+                }
 
-                    const target =
-                    'dist/bank-front/browser/version.json';
-
-                    fs.writeFileSync(
-                    target,
-                    JSON.stringify(versionMetadata, null, 2) + '\\n',
-                    'utf8'
-                    );
-
-                    console.log(`Fichier généré : ${target}`);
-                    NODE
+                sh '''
+                    set -eu
 
                     test \
                     -f dist/bank-front/browser/version.json
 
-                    node -e "
-                    JSON.parse(
-                        require('node:fs').readFileSync(
-                        'dist/bank-front/browser/version.json',
-                        'utf8'
-                        )
-                    )
-                    "
+                    node -e '
+                        const fs = require("node:fs");
 
-                    cat dist/bank-front/browser/version.json
+                        JSON.parse(
+                            fs.readFileSync(
+                                "dist/bank-front/browser/version.json",
+                                "utf8"
+                            )
+                        );
+
+                        console.log("version.json valide");
+                    '
+
+                    echo
+                    echo "=== version.json ==="
+
+                    cat \
+                    dist/bank-front/browser/version.json
 
                     echo
                     echo "Build Angular versionné et validé"
@@ -763,44 +774,44 @@ pipeline {
 
                     cat deployed-version.json
 
-                    node <<'NODE'
-                    const fs = require('node:fs');
+                    node -e '
+                        const fs = require("node:fs");
 
-                    const deployed = JSON.parse(
-                    fs.readFileSync(
-                        'deployed-version.json',
-                        'utf8'
-                    )
-                    );
-
-                    const expected = {
-                    application: 'bank-front',
-                    version: process.env.APP_VERSION,
-                    image: process.env.IMAGE_REF,
-                    gitCommit: process.env.GIT_COMMIT_SHA,
-                    gitShortSha: process.env.GIT_SHORT_SHA,
-                    buildNumber: Number(process.env.BUILD_NUMBER),
-                    buildDate: process.env.BUILD_DATE
-                    };
-
-                    for (const [key, expectedValue] of Object.entries(expected)) {
-                    const actualValue = deployed[key];
-
-                    if (actualValue !== expectedValue) {
-                        throw new Error(
-                        `${key}: attendu=${expectedValue}, obtenu=${actualValue}`
+                        const deployed = JSON.parse(
+                            fs.readFileSync(
+                                "deployed-version.json",
+                                "utf8"
+                            )
                         );
-                    }
-                    }
 
-                    console.log(
-                    `Version déployée validée : ${deployed.version}`
-                    );
+                        const expected = {
+                            application: "bank-front",
+                            version: process.env.APP_VERSION,
+                            image: process.env.IMAGE_REF,
+                            gitCommit: process.env.GIT_COMMIT_SHA,
+                            gitShortSha: process.env.GIT_SHORT_SHA,
+                            buildNumber: Number(process.env.BUILD_NUMBER),
+                            buildDate: process.env.BUILD_DATE
+                        };
 
-                    console.log(
-                    `Image déployée validée : ${deployed.image}`
-                    );
-                    NODE
+                        for (const [key, expectedValue] of Object.entries(expected)) {
+                            const actualValue = deployed[key];
+
+                            if (actualValue !== expectedValue) {
+                                throw new Error(
+                                    `${key}: attendu=${expectedValue}, obtenu=${actualValue}`
+                                );
+                            }
+                        }
+
+                        console.log(
+                            `Version déployée validée : ${deployed.version}`
+                        );
+
+                        console.log(
+                            `Image déployée validée : ${deployed.image}`
+                        );
+                    '
                 '''
             }
         }
