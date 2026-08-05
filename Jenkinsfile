@@ -16,7 +16,8 @@ pipeline {
         SONARQUBE_INSTALLATION = 'sonarqube'
         SONAR_SCANNER_TOOL = 'sonar-scanner'
 
-        IMAGE_REPOSITORY = 'bank-front'
+        NEXUS_DOCKER_REGISTRY = 'localhost:8084'
+        IMAGE_REPOSITORY      = 'localhost:8084/bank-front'
     }
 
     stages {
@@ -545,7 +546,7 @@ pipeline {
             }
         }
 
-        stage('Deploy') {
+        stage('Build image') {
             steps {
                 sh '''
                     set -eu
@@ -573,7 +574,7 @@ pipeline {
                     fi
 
                     echo
-                    echo "=== Construction de l’image versionnée ==="
+                    echo "=== Construction de l’image ==="
 
                     docker compose build \
                     bank-front
@@ -611,27 +612,219 @@ pipeline {
                     test "$IMAGE_REVISION" = "$GIT_COMMIT_SHA"
                     test "$IMAGE_CREATED" = "$BUILD_DATE"
 
-                    if [ -n "${RELEASE_GIT_TAG:-}" ]; then
-                        echo
-                        echo "=== Tag de release détecté ==="
-                        echo "$RELEASE_GIT_TAG"
+                    echo
+                    echo "Image construite : $IMAGE_REF"
+                '''
+            }
+        }
 
-                        docker image tag \
-                        "$IMAGE_REF" \
-                        "$RELEASE_IMAGE_REF"
+        stage('Publish image') {
+            steps {
+                timeout(
+                    time: 10,
+                    unit: 'MINUTES'
+                ) {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'nexus-publisher',
+                            usernameVariable: 'NEXUS_DOCKER_USERNAME',
+                            passwordVariable: 'NEXUS_DOCKER_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
 
-                        docker image inspect \
-                        "$RELEASE_IMAGE_REF" \
-                        >/dev/null
+                            export DOCKER_CONFIG="$WORKSPACE/.docker-nexus"
 
-                        echo "Alias release créé : $RELEASE_IMAGE_REF"
-                    else
-                        echo
-                        echo "Aucun tag Git de release sur ce commit."
-                    fi
+                            rm -rf \
+                            "$DOCKER_CONFIG" \
+                            published-manifest.json \
+                            release-manifest.json \
+                            existing-release-manifest.json \
+                            published-image.properties
+
+                            mkdir -p "$DOCKER_CONFIG"
+
+                            cleanup() {
+                                rm -rf "$DOCKER_CONFIG"
+                            }
+
+                            trap cleanup EXIT HUP INT TERM
+
+                            echo "=== Connexion au registry Nexus ==="
+
+                            set +x
+
+                            printf '%s' "$NEXUS_DOCKER_PASSWORD" |
+                            docker login \
+                                "$NEXUS_DOCKER_REGISTRY" \
+                                --username "$NEXUS_DOCKER_USERNAME" \
+                                --password-stdin \
+                                >/dev/null
+
+                            set -x
+
+                            echo "Connexion Nexus validée"
+
+                            echo
+                            echo "=== Publication du tag CI ==="
+                            echo "$IMAGE_REF"
+
+                            docker push "$IMAGE_REF"
+
+                            echo
+                            echo "=== Vérification du manifest distant ==="
+
+                            docker manifest inspect \
+                            --insecure \
+                            --verbose \
+                            "$IMAGE_REF" \
+                            > published-manifest.json
+
+                            manifest_digest() {
+                                node -e '
+                                    const fs = require("node:fs");
+
+                                    const manifest = JSON.parse(
+                                    fs.readFileSync(
+                                        process.argv[1],
+                                        "utf8"
+                                    )
+                                    );
+
+                                    const digest =
+                                    manifest.Descriptor?.digest ??
+                                    manifest.Digest ??
+                                    manifest.digest ??
+                                    "";
+
+                                    if (!digest.startsWith("sha256:")) {
+                                    throw new Error(
+                                        "Digest distant introuvable"
+                                    );
+                                    }
+
+                                    process.stdout.write(digest);
+                                ' "$1"
+                            }
+
+                            REMOTE_DIGEST="$(
+                                manifest_digest \
+                                published-manifest.json
+                            )"
+
+                            test -n "$REMOTE_DIGEST"
+
+                            echo "Digest Nexus : $REMOTE_DIGEST"
+
+                            RELEASE_DIGEST=""
+
+                            if [ -n "${RELEASE_GIT_TAG:-}" ]; then
+                                echo
+                                echo "=== Publication de la release ==="
+                                echo "Tag Git      : $RELEASE_GIT_TAG"
+                                echo "Image release: $RELEASE_IMAGE_REF"
+
+                                if docker manifest inspect \
+                                    --insecure \
+                                    --verbose \
+                                    "$RELEASE_IMAGE_REF" \
+                                    > existing-release-manifest.json \
+                                    2>/dev/null
+                                then
+                                    EXISTING_RELEASE_DIGEST="$(
+                                        manifest_digest \
+                                        existing-release-manifest.json
+                                    )"
+
+                                    if [ "$EXISTING_RELEASE_DIGEST" != "$REMOTE_DIGEST" ]; then
+                                        echo "Conflit de release immuable."
+                                        echo "Tag        : $RELEASE_IMAGE_REF"
+                                        echo "Nexus      : $EXISTING_RELEASE_DIGEST"
+                                        echo "Build actuel: $REMOTE_DIGEST"
+                                        exit 1
+                                    fi
+
+                                    RELEASE_DIGEST="$EXISTING_RELEASE_DIGEST"
+
+                                    echo "La release existe déjà avec le bon digest."
+                                else
+                                    docker image tag \
+                                    "$IMAGE_REF" \
+                                    "$RELEASE_IMAGE_REF"
+
+                                    docker push \
+                                    "$RELEASE_IMAGE_REF"
+
+                                    docker manifest inspect \
+                                    --insecure \
+                                    --verbose \
+                                    "$RELEASE_IMAGE_REF" \
+                                    > release-manifest.json
+
+                                    RELEASE_DIGEST="$(
+                                        manifest_digest \
+                                        release-manifest.json
+                                    )"
+
+                                    if [ "$RELEASE_DIGEST" != "$REMOTE_DIGEST" ]; then
+                                        echo "Digest de release incohérent."
+                                        echo "Tag CI   : $REMOTE_DIGEST"
+                                        echo "Release  : $RELEASE_DIGEST"
+                                        exit 1
+                                    fi
+
+                                    echo "Release publiée : $RELEASE_IMAGE_REF"
+                                fi
+                            else
+                                echo
+                                echo "Aucun tag Git de release sur ce commit."
+                            fi
+
+                            printf \
+                            'image=%s\\ndigest=%s\\nimmutableRef=%s@%s\\nreleaseImage=%s\\nreleaseDigest=%s\\n' \
+                            "$IMAGE_REF" \
+                            "$REMOTE_DIGEST" \
+                            "$IMAGE_REPOSITORY" \
+                            "$REMOTE_DIGEST" \
+                            "${RELEASE_IMAGE_REF:-}" \
+                            "$RELEASE_DIGEST" \
+                            > published-image.properties
+
+                            printf \
+                            'digest=%s\\nimmutableRef=%s@%s\\n' \
+                            "$REMOTE_DIGEST" \
+                            "$IMAGE_REPOSITORY" \
+                            "$REMOTE_DIGEST" \
+                            >> build-metadata.properties
+
+                            echo
+                            echo "=== Image publiée ==="
+
+                            cat published-image.properties
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "=== Image publiée à déployer ==="
+                    echo "$IMAGE_REF"
+
+                    test \
+                    -f published-image.properties
+
+                    docker image inspect \
+                    "$IMAGE_REF" \
+                    >/dev/null
 
                     echo
-                    echo "=== Déploiement ==="
+                    echo "=== Déploiement Compose ==="
 
                     docker compose up \
                     -d \
@@ -841,7 +1034,10 @@ pipeline {
             archiveArtifacts(
                 artifacts: '''
                     build-metadata.properties,
-                    deployed-version.json
+                    deployed-version.json,
+                    published-image.properties,
+                    published-manifest.json,
+                    release-manifest.json
                 ''',
                 allowEmptyArchive: true,
                 fingerprint: true
