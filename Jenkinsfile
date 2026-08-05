@@ -682,20 +682,36 @@ pipeline {
                                 MANIFEST_FILE="$2"
                                 HEADERS_FILE="$3"
 
-                                IMAGE_WITH_TAG="${
-                                    IMAGE_REFERENCE#${NEXUS_DOCKER_REGISTRY}/
-                                }"
+                                case "$IMAGE_REFERENCE" in
+                                    "$NEXUS_DOCKER_REGISTRY"/*)
+                                        # Supprime uniquement le premier segment host:port/
+                                        # Exemple :
+                                        # localhost:8084/bank-front:0.1.0
+                                        # devient :
+                                        # bank-front:0.1.0
+                                        IMAGE_WITH_TAG="${IMAGE_REFERENCE#*/}"
+                                        ;;
+
+                                    *)
+                                        echo "Référence registry inattendue : $IMAGE_REFERENCE" >&2
+                                        echo "Registry attendu : $NEXUS_DOCKER_REGISTRY" >&2
+                                        return 1
+                                        ;;
+                                esac
 
                                 REPOSITORY_NAME="${IMAGE_WITH_TAG%:*}"
                                 TAG_VALUE="${IMAGE_WITH_TAG##*:}"
 
-                                MANIFEST_URL="${
-                                    NEXUS_DOCKER_API_URL
-                                }/v2/${
-                                    REPOSITORY_NAME
-                                }/manifests/${
-                                    TAG_VALUE
-                                }"
+                                if [ -z "$REPOSITORY_NAME" ] ||
+                                [ -z "$TAG_VALUE" ] ||
+                                [ "$REPOSITORY_NAME" = "$IMAGE_WITH_TAG" ] ||
+                                [ "$TAG_VALUE" = "$IMAGE_WITH_TAG" ]
+                                then
+                                    echo "Référence d’image invalide : $IMAGE_REFERENCE" >&2
+                                    return 1
+                                fi
+
+                                MANIFEST_URL="${NEXUS_DOCKER_API_URL}/v2/${REPOSITORY_NAME}/manifests/${TAG_VALUE}"
 
                                 rm -f \
                                 "$MANIFEST_FILE" \
@@ -729,10 +745,7 @@ pipeline {
                                 set -e
 
                                 if [ "$CURL_STATUS" -ne 0 ]; then
-                                    echo \
-                                    "Erreur réseau pendant la lecture du manifest." \
-                                    >&2
-
+                                    echo "Erreur réseau pendant la lecture du manifest." >&2
                                     return 1
                                 fi
 
@@ -741,18 +754,12 @@ pipeline {
                                         ;;
 
                                     404)
-                                        echo \
-                                        "Manifest absent : $IMAGE_REFERENCE" \
-                                        >&2
-
+                                        echo "Manifest absent : $IMAGE_REFERENCE" >&2
                                         return 44
                                         ;;
 
                                     *)
-                                        echo \
-                                        "Réponse Nexus inattendue : HTTP $HTTP_CODE" \
-                                        >&2
-
+                                        echo "Réponse Nexus inattendue : HTTP $HTTP_CODE" >&2
                                         cat "$MANIFEST_FILE" >&2 || true
                                         return 1
                                         ;;
@@ -763,35 +770,25 @@ pipeline {
                                         const fs = require("node:fs");
 
                                         const lines = fs
-                                        .readFileSync(
-                                            process.argv[1],
-                                            "utf8"
-                                        )
-                                        .split(
-                                            String.fromCharCode(10)
-                                        );
+                                        .readFileSync(process.argv[1], "utf8")
+                                        .split(/\r?\n/);
 
-                                        const line = lines.find(
-                                        (value) =>
-                                            value
+                                        const digestHeader = lines.find(
+                                        (line) =>
+                                            line
                                             .toLowerCase()
-                                            .startsWith(
-                                                "docker-content-digest:"
-                                            )
+                                            .startsWith("docker-content-digest:")
                                         );
 
-                                        if (!line) {
+                                        if (!digestHeader) {
+                                        console.error(
+                                            "Header Docker-Content-Digest introuvable"
+                                        );
                                         process.exit(2);
                                         }
 
-                                        const digest = line
-                                        .slice(
-                                            line.indexOf(":") + 1
-                                        )
-                                        .replaceAll(
-                                            String.fromCharCode(13),
-                                            ""
-                                        )
+                                        const digest = digestHeader
+                                        .slice(digestHeader.indexOf(":") + 1)
                                         .trim();
 
                                         process.stdout.write(digest);
@@ -799,14 +796,9 @@ pipeline {
                                 )"
 
                                 if ! printf '%s' "$DIGEST" |
-                                    grep \
-                                    -Eq \
-                                    '^sha256:[0-9a-f]{64}$'
+                                    grep -Eq '^sha256:[0-9a-f]{64}$'
                                 then
-                                    echo \
-                                    "Digest Nexus invalide : $DIGEST" \
-                                    >&2
-
+                                    echo "Digest Nexus invalide : $DIGEST" >&2
                                     return 1
                                 fi
 
