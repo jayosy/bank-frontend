@@ -2,7 +2,7 @@ name: bank-front-lab
 
 services:
   bank-front:
-    image: "${IMAGE_REPOSITORY:-bank-front}:${IMAGE_TAG:-dev}"
+    image:  "${BANK_FRONT_IMAGE:-bank-front:dev}"
     build:
       context: .
       dockerfile: Dockerfile

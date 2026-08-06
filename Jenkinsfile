@@ -167,7 +167,8 @@ pipeline {
 
                     env.IMAGE_REF =
                         "${env.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"
-
+                    env.BANK_FRONT_IMAGE =env.IMAGE_REF
+                    
                     env.RELEASE_GIT_TAG = sh(
                         script: """
                             git tag \
@@ -925,66 +926,324 @@ pipeline {
                             cat published-image.properties
                         '''
                     }
-                }
-            }
-        }
+                },
+                script {
+                    env.IMAGE_DIGEST = sh(
+                        script: '''
+                            set -eu
 
-        stage('Deploy') {
-            steps {
+                            sed -n \
+                            's/^digest=//p' \
+                            published-image.properties |
+                            head -n 1
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    env.IMMUTABLE_IMAGE_REF = sh(
+                        script: '''
+                            set -eu
+
+                            sed -n \
+                            's/^immutableRef=//p' \
+                            published-image.properties |
+                            head -n 1
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    def digestPattern =
+                        '^sha256:[0-9a-f]{64}$'
+
+                    if (!(env.IMAGE_DIGEST ==~ digestPattern)) {
+                        error(
+                            "Digest Nexus invalide : " +
+                            env.IMAGE_DIGEST
+                        )
+                    }
+
+                    def expectedImmutableRef =
+                        "${env.IMAGE_REPOSITORY}" +
+                        "@${env.IMAGE_DIGEST}"
+
+                    if (
+                        env.IMMUTABLE_IMAGE_REF !=
+                        expectedImmutableRef
+                    ) {
+                        error(
+                            "Référence immuable incohérente. " +
+                            "Attendue=${expectedImmutableRef}, " +
+                            "obtenue=${env.IMMUTABLE_IMAGE_REF}"
+                        )
+                    }
+
+                    env.BANK_FRONT_IMAGE =
+                        env.IMMUTABLE_IMAGE_REF
+
+                    echo(
+                        "Référence immuable validée : " +
+                        env.IMMUTABLE_IMAGE_REF
+                    )
+                }
                 sh '''
                     set -eu
 
-                    echo "=== Image publiée à déployer ==="
-                    echo "$IMAGE_REF"
-
-                    test \
-                    -f published-image.properties
-
-                    docker image inspect \
-                    "$IMAGE_REF" \
-                    >/dev/null
-
                     echo
-                    echo "=== Déploiement Compose ==="
-
-                    docker compose up \
-                    -d \
-                    --no-build \
-                    bank-front
-
-                    docker compose ps \
-                    bank-front
-
-                    CONTAINER_ID="$(
-                        docker compose ps \
-                        -q \
-                        bank-front
-                    )"
-
-                    test -n "$CONTAINER_ID"
-
-                    RUNNING_IMAGE_ID="$(
-                        docker inspect \
-                        --format '{{.Image}}' \
-                        "$CONTAINER_ID"
-                    )"
-
-                    EXPECTED_IMAGE_ID="$(
-                        docker image inspect \
-                        --format '{{.Id}}' \
-                        "$IMAGE_REF"
-                    )"
-
-                    if [ "$RUNNING_IMAGE_ID" != "$EXPECTED_IMAGE_ID" ]; then
-                        echo "Le conteneur n’utilise pas l’image attendue."
-                        echo "Image active   : $RUNNING_IMAGE_ID"
-                        echo "Image attendue : $EXPECTED_IMAGE_ID"
-                        exit 1
-                    fi
-
-                    echo
-                    echo "Image déployée : $IMAGE_REF"
+                    echo "=== Artefact Nexus sélectionné ==="
+                    echo "Tag    : $IMAGE_REF"
+                    echo "Digest : $IMAGE_DIGEST"
+                    echo "Image  : $IMMUTABLE_IMAGE_REF"
                 '''
+            }
+        }
+
+        stage('Deploy by digest') {
+            steps {
+                script {
+                    if (!env.IMAGE_DIGEST?.trim()) {
+                        error(
+                            'IMAGE_DIGEST est absent après la publication Nexus.'
+                        )
+                    }
+
+                    if (!env.IMMUTABLE_IMAGE_REF?.trim()) {
+                        error(
+                            'IMMUTABLE_IMAGE_REF est absent après la publication Nexus.'
+                        )
+                    }
+                }
+
+                timeout(
+                    time: 10,
+                    unit: 'MINUTES'
+                ) {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'nexus-publisher',
+                            usernameVariable: 'NEXUS_DOCKER_USERNAME',
+                            passwordVariable: 'NEXUS_DOCKER_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            export DOCKER_CONFIG="$WORKSPACE/.docker-deploy"
+
+                            rm -rf \
+                            "$DOCKER_CONFIG" \
+                            deployed-image.properties
+
+                            mkdir -p "$DOCKER_CONFIG"
+
+                            cleanup() {
+                                rm -rf "$DOCKER_CONFIG"
+                            }
+
+                            trap cleanup EXIT HUP INT TERM
+
+                            EXPECTED_IMMUTABLE_REF="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+
+                            if [
+                                "$IMMUTABLE_IMAGE_REF" !=
+                                "$EXPECTED_IMMUTABLE_REF"
+                            ]; then
+                                echo "Référence immuable invalide."
+                                echo "Attendue : $EXPECTED_IMMUTABLE_REF"
+                                echo "Obtenue  : $IMMUTABLE_IMAGE_REF"
+                                exit 1
+                            fi
+
+                            echo "=== Déploiement Nexus par digest ==="
+                            echo "Tag source : $IMAGE_REF"
+                            echo "Digest     : $IMAGE_DIGEST"
+                            echo "Référence  : $IMMUTABLE_IMAGE_REF"
+
+                            echo
+                            echo "=== Connexion temporaire à Nexus ==="
+
+                            set +x
+
+                            if ! printf '%s' "$NEXUS_DOCKER_PASSWORD" |
+                                docker login \
+                                "$NEXUS_DOCKER_REGISTRY" \
+                                --username "$NEXUS_DOCKER_USERNAME" \
+                                --password-stdin \
+                                >/dev/null
+                            then
+                                set -x
+                                echo "Connexion Nexus impossible."
+                                exit 1
+                            fi
+
+                            set -x
+
+                            echo "Connexion Nexus validée"
+
+                            echo
+                            echo "=== Suppression des références locales du build ==="
+
+                            docker image rm \
+                            "$IMAGE_REF" \
+                            >/dev/null \
+                            2>&1 ||
+                            true
+
+                            docker image rm \
+                            "$IMMUTABLE_IMAGE_REF" \
+                            >/dev/null \
+                            2>&1 ||
+                            true
+
+                            echo
+                            echo "=== Pull explicite par digest ==="
+
+                            docker pull \
+                            "$IMMUTABLE_IMAGE_REF"
+
+                            docker image inspect \
+                            "$IMMUTABLE_IMAGE_REF" \
+                            >/dev/null
+
+                            echo
+                            echo "=== Vérification du RepoDigest local ==="
+
+                            PULLED_REPO_DIGESTS="$(
+                                docker image inspect \
+                                --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                                "$IMMUTABLE_IMAGE_REF"
+                            )"
+
+                            printf '%s\n' \
+                            "$PULLED_REPO_DIGESTS"
+
+                            if ! printf '%s\n' "$PULLED_REPO_DIGESTS" |
+                                grep \
+                                -Fqx \
+                                "$IMMUTABLE_IMAGE_REF"
+                            then
+                                echo "Le digest Nexus attendu n’est pas présent localement."
+                                echo "Attendu : $IMMUTABLE_IMAGE_REF"
+                                exit 1
+                            fi
+
+                            echo
+                            echo "=== Configuration Compose résolue ==="
+
+                            export BANK_FRONT_IMAGE="$IMMUTABLE_IMAGE_REF"
+
+                            docker compose config \
+                            >/dev/null
+
+                            RESOLVED_IMAGE="$(
+                                docker compose config \
+                                --images |
+                                head -n 1
+                            )"
+
+                            echo "Image Compose : $RESOLVED_IMAGE"
+
+                            if [
+                                "$RESOLVED_IMAGE" !=
+                                "$IMMUTABLE_IMAGE_REF"
+                            ]; then
+                                echo "Compose ne référence pas le digest attendu."
+                                echo "Attendue : $IMMUTABLE_IMAGE_REF"
+                                echo "Résolue  : $RESOLVED_IMAGE"
+                                exit 1
+                            fi
+
+                            echo
+                            echo "=== Recréation du conteneur ==="
+
+                            docker compose up \
+                            -d \
+                            --no-build \
+                            --pull never \
+                            --force-recreate \
+                            bank-front
+
+                            docker compose ps \
+                            bank-front
+
+                            CONTAINER_ID="$(
+                                docker compose ps \
+                                -q \
+                                bank-front
+                            )"
+
+                            if [ -z "$CONTAINER_ID" ]; then
+                                echo "Conteneur bank-front introuvable."
+                                exit 1
+                            fi
+
+                            echo
+                            echo "=== Vérification du conteneur ==="
+
+                            CONTAINER_IMAGE_REFERENCE="$(
+                                docker inspect \
+                                --format '{{.Config.Image}}' \
+                                "$CONTAINER_ID"
+                            )"
+
+                            RUNNING_IMAGE_ID="$(
+                                docker inspect \
+                                --format '{{.Image}}' \
+                                "$CONTAINER_ID"
+                            )"
+
+                            EXPECTED_IMAGE_ID="$(
+                                docker image inspect \
+                                --format '{{.Id}}' \
+                                "$IMMUTABLE_IMAGE_REF"
+                            )"
+
+                            echo "Référence configurée : $CONTAINER_IMAGE_REFERENCE"
+                            echo "Image ID active      : $RUNNING_IMAGE_ID"
+                            echo "Image ID attendue    : $EXPECTED_IMAGE_ID"
+
+                            if [
+                                "$CONTAINER_IMAGE_REFERENCE" !=
+                                "$IMMUTABLE_IMAGE_REF"
+                            ]; then
+                                echo "Le conteneur n’a pas été créé avec le digest attendu."
+                                echo "Attendu : $IMMUTABLE_IMAGE_REF"
+                                echo "Actif   : $CONTAINER_IMAGE_REFERENCE"
+                                exit 1
+                            fi
+
+                            if [
+                                "$RUNNING_IMAGE_ID" !=
+                                "$EXPECTED_IMAGE_ID"
+                            ]; then
+                                echo "Le contenu exécuté ne correspond pas à l’image tirée."
+                                echo "Actif   : $RUNNING_IMAGE_ID"
+                                echo "Attendu : $EXPECTED_IMAGE_ID"
+                                exit 1
+                            fi
+
+                            printf \
+                            'sourceTag=%s\ndigest=%s\nimmutableRef=%s\ncontainerId=%s\ncontainerImageRef=%s\nrunningImageId=%s\nbuildNumber=%s\ngitCommit=%s\n' \
+                            "$IMAGE_REF" \
+                            "$IMAGE_DIGEST" \
+                            "$IMMUTABLE_IMAGE_REF" \
+                            "$CONTAINER_ID" \
+                            "$CONTAINER_IMAGE_REFERENCE" \
+                            "$RUNNING_IMAGE_ID" \
+                            "$BUILD_NUMBER" \
+                            "$GIT_COMMIT_SHA" \
+                            > deployed-image.properties
+
+                            echo
+                            echo "=== Preuve de déploiement immuable ==="
+
+                            cat deployed-image.properties
+
+                            echo
+                            echo "Image déployée par digest :"
+                            echo "$IMMUTABLE_IMAGE_REF"
+                        '''
+                    }
+                }
             }
         }
 
@@ -1129,6 +1388,42 @@ pipeline {
                             `Image déployée validée : ${deployed.image}`
                         );
                     '
+                    echo
+                    echo "=== Vérification de la preuve de déploiement ==="
+
+                    test \
+                    -f deployed-image.properties
+
+                    DEPLOYED_DIGEST="$(
+                        sed -n \
+                        's/^digest=//p' \
+                        deployed-image.properties |
+                        head -n 1
+                    )"
+
+                    DEPLOYED_IMMUTABLE_REF="$(
+                        sed -n \
+                        's/^immutableRef=//p' \
+                        deployed-image.properties |
+                        head -n 1
+                    )"
+
+                    if [ "$DEPLOYED_DIGEST" != "$IMAGE_DIGEST" ]; then
+                        echo "Digest déployé incohérent."
+                        echo "Attendu : $IMAGE_DIGEST"
+                        echo "Déployé : $DEPLOYED_DIGEST"
+                        exit 1
+                    fi
+
+                    if ["$DEPLOYED_IMMUTABLE_REF" != "$IMMUTABLE_IMAGE_REF"]; then
+                        echo "Référence déployée incohérente."
+                        echo "Attendue : $IMMUTABLE_IMAGE_REF"
+                        echo "Déployée : $DEPLOYED_IMMUTABLE_REF"
+                        exit 1
+                    fi
+
+                    echo "Digest déployé validé : $DEPLOYED_DIGEST"
+                    echo "Référence immuable validée : $DEPLOYED_IMMUTABLE_REF"
                 '''
             }
         }
@@ -1156,9 +1451,12 @@ pipeline {
                 artifacts: '''
                     build-metadata.properties,
                     deployed-version.json,
+                    deployed-image.properties,
                     published-image.properties,
                     published-manifest.json,
-                    release-manifest.json
+                    published-manifest.headers,
+                    release-manifest.json,
+                    release-manifest.headers
                 ''',
                 allowEmptyArchive: true,
                 fingerprint: true
@@ -1166,7 +1464,9 @@ pipeline {
 
             echo "Build Jenkins : ${env.BUILD_NUMBER}"
             echo "Version       : ${env.APP_VERSION ?: 'inconnue'}"
-            echo "Image         : ${env.IMAGE_REF ?: 'inconnue'}"
+            echo "Tag image     : ${env.IMAGE_REF ?: 'inconnue'}"
+            echo "Digest        : ${env.IMAGE_DIGEST ?: 'inconnu'}"
+            echo "Image immuable: ${env.IMMUTABLE_IMAGE_REF ?: 'inconnue'}"
             echo "Commit Git    : ${env.GIT_COMMIT_SHA ?: 'inconnu'}"
         }
     }
