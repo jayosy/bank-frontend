@@ -926,7 +926,7 @@ pipeline {
                             cat published-image.properties
                         '''
                     }
-                },
+                }
                 script {
                     env.IMAGE_DIGEST = sh(
                         script: '''
