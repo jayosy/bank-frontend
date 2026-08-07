@@ -1574,10 +1574,7 @@ pipeline {
 
                             EXPECTED_IMMUTABLE_REF="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
 
-                            if [
-                                "$IMMUTABLE_IMAGE_REF" !=
-                                "$EXPECTED_IMMUTABLE_REF"
-                            ]; then
+                            if ["$IMMUTABLE_IMAGE_REF" !="$EXPECTED_IMMUTABLE_REF"]; then
                                 echo "Référence immuable invalide."
                                 echo "Attendue : $EXPECTED_IMMUTABLE_REF"
                                 echo "Obtenue  : $IMMUTABLE_IMAGE_REF"
@@ -1673,10 +1670,7 @@ pipeline {
 
                             echo "Image Compose : $RESOLVED_IMAGE"
 
-                            if [
-                                "$RESOLVED_IMAGE" !=
-                                "$IMMUTABLE_IMAGE_REF"
-                            ]; then
+                            if ["$RESOLVED_IMAGE" != "$IMMUTABLE_IMAGE_REF"]; then
                                 echo "Compose ne référence pas le digest attendu."
                                 echo "Attendue : $IMMUTABLE_IMAGE_REF"
                                 echo "Résolue  : $RESOLVED_IMAGE"
@@ -1732,20 +1726,14 @@ pipeline {
                             echo "Image ID active      : $RUNNING_IMAGE_ID"
                             echo "Image ID attendue    : $EXPECTED_IMAGE_ID"
 
-                            if [
-                                "$CONTAINER_IMAGE_REFERENCE" !=
-                                "$IMMUTABLE_IMAGE_REF"
-                            ]; then
+                            if ["$CONTAINER_IMAGE_REFERENCE" != "$IMMUTABLE_IMAGE_REF"]; then
                                 echo "Le conteneur n’a pas été créé avec le digest attendu."
                                 echo "Attendu : $IMMUTABLE_IMAGE_REF"
                                 echo "Actif   : $CONTAINER_IMAGE_REFERENCE"
                                 exit 1
                             fi
 
-                            if [
-                                "$RUNNING_IMAGE_ID" !=
-                                "$EXPECTED_IMAGE_ID"
-                            ]; then
+                            if ["$RUNNING_IMAGE_ID" != "$EXPECTED_IMAGE_ID"]; then
                                 echo "Le contenu exécuté ne correspond pas à l’image tirée."
                                 echo "Actif   : $RUNNING_IMAGE_ID"
                                 echo "Attendu : $EXPECTED_IMAGE_ID"
