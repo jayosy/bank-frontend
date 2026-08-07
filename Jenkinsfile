@@ -243,6 +243,7 @@ pipeline {
                         coverage \
                         coverage-publish \
                         trivy-reports \
+                        sbom-reports \
                         dist \
                         .angular/cache
 
@@ -1295,6 +1296,233 @@ pipeline {
                             alwaysLinkToLastBuild: true,
                             allowMissing: true
                         ]
+                    )
+                }
+            }
+        }
+
+        stage('Generate SBOM') {
+            steps {
+                timeout(
+                    time: 5,
+                    unit: 'MINUTES'
+                ) {
+                    sh '''
+                        set -eu
+
+                        SBOM_DIR="sbom-reports"
+                        SBOM_FILE="$SBOM_DIR/bank-front.cdx.json"
+
+                        rm -rf "$SBOM_DIR"
+                        mkdir -p "$SBOM_DIR"
+
+                        echo "=== Génération du SBOM ==="
+
+                        echo "Image :"
+                        echo "$IMMUTABLE_IMAGE_REF"
+
+                        echo
+                        echo "Digest :"
+                        echo "$IMAGE_DIGEST"
+
+                        EXPECTED_REF="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+
+                        if [ "$IMMUTABLE_IMAGE_REF" != "$EXPECTED_REF" ]; then
+                            echo "Référence immuable incohérente."
+                            echo "Attendue : $EXPECTED_REF"
+                            echo "Obtenue  : $IMMUTABLE_IMAGE_REF"
+                            exit 1
+                        fi
+
+                        echo
+                        echo "=== Vérification de l’image locale ==="
+
+                        docker image inspect \
+                        "$IMMUTABLE_IMAGE_REF" \
+                        >/dev/null
+
+                        REPO_DIGESTS="$(
+                            docker image inspect \
+                            --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                            "$IMMUTABLE_IMAGE_REF"
+                        )"
+
+                        printf '%s\\n' "$REPO_DIGESTS"
+
+                        if ! printf '%s\\n' "$REPO_DIGESTS" |
+                            grep \
+                            -Fqx \
+                            "$IMMUTABLE_IMAGE_REF"
+                        then
+                            echo "L’image locale ne correspond pas au digest attendu."
+                            exit 1
+                        fi
+
+                        echo
+                        echo "=== Trivy → CycloneDX ==="
+
+                        docker run \
+                        --rm \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        -v "$TRIVY_CACHE_VOLUME:/root/.cache" \
+                        "$TRIVY_IMAGE" \
+                        image \
+                        --image-src docker \
+                        --format cyclonedx \
+                        --skip-version-check \
+                        --disable-telemetry \
+                        --no-progress \
+                        "$IMMUTABLE_IMAGE_REF" \
+                        > "$SBOM_FILE"
+
+                        test -s "$SBOM_FILE"
+
+                        echo
+                        echo "SBOM généré : $SBOM_FILE"
+
+                        echo
+                        echo "=== Validation CycloneDX ==="
+
+                        node -e '
+                            const fs = require("node:fs");
+                            const crypto = require("node:crypto");
+
+                            const file =
+                            "sbom-reports/bank-front.cdx.json";
+
+                            const raw =
+                            fs.readFileSync(file, "utf8");
+
+                            const sbom =
+                            JSON.parse(raw);
+
+                            if (sbom.bomFormat !== "CycloneDX") {
+                                throw new Error(
+                                "Le document généré n’est pas un SBOM CycloneDX"
+                                );
+                            }
+
+                            if (!sbom.specVersion) {
+                                throw new Error(
+                                "specVersion CycloneDX absente"
+                                );
+                            }
+
+                            if (!sbom.serialNumber) {
+                                throw new Error(
+                                "serialNumber CycloneDX absent"
+                                );
+                            }
+
+                            if (!sbom.metadata?.component) {
+                                throw new Error(
+                                "Composant principal du SBOM absent"
+                                );
+                            }
+
+                            const components =
+                            Array.isArray(sbom.components)
+                                ? sbom.components
+                                : [];
+
+                            const sha256 =
+                            crypto
+                                .createHash("sha256")
+                                .update(raw)
+                                .digest("hex");
+
+                            const nl =
+                            String.fromCharCode(10);
+
+                            const summary = [
+                            `bomFormat=${sbom.bomFormat}`,
+                            `specVersion=${sbom.specVersion}`,
+                            `serialNumber=${sbom.serialNumber}`,
+                            `components=${components.length}`,
+                            `sbomSha256=${sha256}`
+                            ].join(nl) + nl;
+
+                            fs.writeFileSync(
+                            "sbom-reports/summary.properties",
+                            summary,
+                            "utf8"
+                            );
+
+                            fs.writeFileSync(
+                            "sbom-reports/sbom.sha256",
+                            sha256 +
+                                "  bank-front.cdx.json" +
+                                nl,
+                            "utf8"
+                            );
+
+                            console.log(
+                            `Format       : ${sbom.bomFormat}`
+                            );
+
+                            console.log(
+                            `Spec         : ${sbom.specVersion}`
+                            );
+
+                            console.log(
+                            `Composants   : ${components.length}`
+                            );
+
+                            console.log(
+                            `SHA-256 SBOM : ${sha256}`
+                            );
+                        '
+
+                        echo
+                        echo "=== Vérification du digest dans le SBOM ==="
+
+                        if ! grep \
+                            -Fq \
+                            "$IMAGE_DIGEST" \
+                            "$SBOM_FILE"
+                        then
+                            echo "Le digest de l’image n’apparaît pas dans le SBOM."
+                            echo "Digest attendu : $IMAGE_DIGEST"
+                            exit 1
+                        fi
+
+                        echo "Digest de l’image retrouvé dans le SBOM."
+
+                        echo
+                        echo "=== Provenance SBOM ==="
+
+                        printf \
+                        'application=%s\\nversion=%s\\ngitCommit=%s\\nbuildNumber=%s\\nimageTag=%s\\nimageDigest=%s\\nimmutableRef=%s\\nsbom=%s\\n' \
+                        "bank-front" \
+                        "$APP_VERSION" \
+                        "$GIT_COMMIT_SHA" \
+                        "$BUILD_NUMBER" \
+                        "$IMAGE_REF" \
+                        "$IMAGE_DIGEST" \
+                        "$IMMUTABLE_IMAGE_REF" \
+                        "$SBOM_FILE" \
+                        > "$SBOM_DIR/provenance.properties"
+
+                        cat \
+                        "$SBOM_DIR/summary.properties"
+
+                        echo
+
+                        cat \
+                        "$SBOM_DIR/provenance.properties"
+
+                        echo
+                        echo "SBOM CycloneDX validé."
+                    '''
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'sbom-reports/**/*',
+                        allowEmptyArchive: true,
+                        fingerprint: true
                     )
                 }
             }

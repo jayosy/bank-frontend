@@ -13,6 +13,7 @@ module.exports = defineConfig([
       'dist/**',
       '.angular/**',
       'trivy-reports/**',
+      'sbom-reports/**',
       '.nginx/**',
       '.scannerwork/**'
     ]

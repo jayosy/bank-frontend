@@ -50,3 +50,4 @@ Thumbs.db
 /.scannerwork/
 
 trivy-reports/
+sbom-reports/
