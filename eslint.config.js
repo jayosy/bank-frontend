@@ -12,6 +12,7 @@ module.exports = defineConfig([
       'coverage-publish/**',
       'dist/**',
       '.angular/**',
+      'trivy-reports/**',
       '.nginx/**',
       '.scannerwork/**'
     ]

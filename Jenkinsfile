@@ -19,6 +19,11 @@ pipeline {
         NEXUS_DOCKER_REGISTRY = 'localhost:8084'
         NEXUS_DOCKER_API_URL  = 'http://host.docker.internal:8084'
         IMAGE_REPOSITORY      = 'localhost:8084/bank-front'
+
+        TRIVY_IMAGE = 'aquasec/trivy:0.72.0'
+        TRIVY_CACHE_VOLUME = 'trivy-cache'
+        TRIVY_REPORT_SEVERITY = 'HIGH,CRITICAL'
+        TRIVY_GATE_SEVERITY = 'CRITICAL'
     }
 
     stages {
@@ -237,6 +242,7 @@ pipeline {
                         rm -rf \
                         coverage \
                         coverage-publish \
+                        trivy-reports \
                         dist \
                         .angular/cache
 
@@ -994,6 +1000,303 @@ pipeline {
                     echo "Digest : $IMAGE_DIGEST"
                     echo "Image  : $IMMUTABLE_IMAGE_REF"
                 '''
+            }
+        }
+
+        stage('Trivy image scan') {
+            steps {
+                timeout(
+                    time: 10,
+                    unit: 'MINUTES'
+                ) {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'nexus-publisher',
+                            usernameVariable: 'NEXUS_DOCKER_USERNAME',
+                            passwordVariable: 'NEXUS_DOCKER_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            REPORT_DIR="trivy-reports"
+
+                            rm -rf \
+                            "$REPORT_DIR" \
+                            "$WORKSPACE/.docker-trivy"
+
+                            mkdir -p \
+                            "$REPORT_DIR" \
+                            "$WORKSPACE/.docker-trivy"
+
+                            export DOCKER_CONFIG="$WORKSPACE/.docker-trivy"
+
+                            cleanup() {
+                                rm -rf "$DOCKER_CONFIG"
+                            }
+
+                            trap cleanup EXIT HUP INT TERM
+
+                            echo "=== Préparation Trivy ==="
+
+                            docker volume inspect \
+                            "$TRIVY_CACHE_VOLUME" \
+                            >/dev/null
+
+                            docker pull \
+                            "$TRIVY_IMAGE" \
+                            >/dev/null
+
+                            echo
+                            echo "=== Version Trivy ==="
+
+                            docker run \
+                            --rm \
+                            -v "$TRIVY_CACHE_VOLUME:/root/.cache" \
+                            "$TRIVY_IMAGE" \
+                            --version
+
+                            echo
+                            echo "=== Image immuable à scanner ==="
+
+                            echo "$IMMUTABLE_IMAGE_REF"
+
+                            EXPECTED_REF="${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+
+                            if [ "$IMMUTABLE_IMAGE_REF" != "$EXPECTED_REF" ]; then
+                                echo "Référence immuable incohérente."
+                                echo "Attendue : $EXPECTED_REF"
+                                echo "Obtenue  : $IMMUTABLE_IMAGE_REF"
+                                exit 1
+                            fi
+
+                            echo
+                            echo "=== Authentification Nexus ==="
+
+                            set +x
+
+                            if ! printf '%s' "$NEXUS_DOCKER_PASSWORD" |
+                                docker login \
+                                "$NEXUS_DOCKER_REGISTRY" \
+                                --username "$NEXUS_DOCKER_USERNAME" \
+                                --password-stdin \
+                                >/dev/null
+                            then
+                                set -x
+                                echo "Connexion Nexus impossible."
+                                exit 1
+                            fi
+
+                            set -x
+
+                            echo "Connexion Nexus validée"
+
+                            echo
+                            echo "=== Pull de l’image par digest ==="
+
+                            docker pull \
+                            "$IMMUTABLE_IMAGE_REF"
+
+                            docker image inspect \
+                            "$IMMUTABLE_IMAGE_REF" \
+                            >/dev/null
+
+                            echo
+                            echo "=== Vérification du RepoDigest ==="
+
+                            REPO_DIGESTS="$(
+                                docker image inspect \
+                                --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                                "$IMMUTABLE_IMAGE_REF"
+                            )"
+
+                            printf '%s\\n' "$REPO_DIGESTS"
+
+                            if ! printf '%s\\n' "$REPO_DIGESTS" |
+                                grep \
+                                -Fqx \
+                                "$IMMUTABLE_IMAGE_REF"
+                            then
+                                echo "Le digest attendu n’est pas présent localement."
+                                echo "Attendu : $IMMUTABLE_IMAGE_REF"
+                                exit 1
+                            fi
+
+                            echo
+                            echo "=== Rapport JSON HIGH + CRITICAL ==="
+
+                            docker run \
+                            --rm \
+                            -v /var/run/docker.sock:/var/run/docker.sock \
+                            -v "$TRIVY_CACHE_VOLUME:/root/.cache" \
+                            "$TRIVY_IMAGE" \
+                            image \
+                            --image-src docker \
+                            --scanners vuln \
+                            --severity "$TRIVY_REPORT_SEVERITY" \
+                            --skip-db-update \
+                            --skip-java-db-update \
+                            --offline-scan \
+                            --skip-version-check \
+                            --disable-telemetry \
+                            --no-progress \
+                            --exit-code 0 \
+                            --format json \
+                            "$IMMUTABLE_IMAGE_REF" \
+                            > "$REPORT_DIR/image.json"
+
+                            test \
+                            -s "$REPORT_DIR/image.json"
+
+                            echo
+                            echo "=== Rapport HTML HIGH + CRITICAL ==="
+
+                            docker run \
+                            --rm \
+                            -v /var/run/docker.sock:/var/run/docker.sock \
+                            -v "$TRIVY_CACHE_VOLUME:/root/.cache" \
+                            "$TRIVY_IMAGE" \
+                            image \
+                            --image-src docker \
+                            --scanners vuln \
+                            --severity "$TRIVY_REPORT_SEVERITY" \
+                            --skip-db-update \
+                            --skip-java-db-update \
+                            --offline-scan \
+                            --skip-version-check \
+                            --disable-telemetry \
+                            --no-progress \
+                            --exit-code 0 \
+                            --format template \
+                            --template "@/contrib/html.tpl" \
+                            "$IMMUTABLE_IMAGE_REF" \
+                            > "$REPORT_DIR/image.html"
+
+                            test \
+                            -s "$REPORT_DIR/image.html"
+
+                            echo
+                            echo "=== Résumé Trivy ==="
+
+                            node -e '
+                                const fs = require("node:fs");
+
+                                const report = JSON.parse(
+                                    fs.readFileSync(
+                                        "trivy-reports/image.json",
+                                        "utf8"
+                                    )
+                                );
+
+                                const vulnerabilities =
+                                    (report.Results || [])
+                                    .flatMap(
+                                        (result) =>
+                                            result.Vulnerabilities || []
+                                    );
+
+                                const high = vulnerabilities.filter(
+                                    (vulnerability) =>
+                                        vulnerability.Severity === "HIGH"
+                                ).length;
+
+                                const critical = vulnerabilities.filter(
+                                    (vulnerability) =>
+                                        vulnerability.Severity === "CRITICAL"
+                                ).length;
+
+                                console.log("HIGH     : " + high);
+                                console.log("CRITICAL : " + critical);
+
+                                fs.writeFileSync(
+                                    "trivy-reports/summary.properties",
+                                    "high=" + high + "\\n" +
+                                    "critical=" + critical + "\\n",
+                                    "utf8"
+                                );
+                            '
+
+                            cat \
+                            "$REPORT_DIR/summary.properties"
+
+                            echo
+                            echo "=== Security Gate Trivy ==="
+                            echo \
+                            "Politique : vulnérabilités $TRIVY_GATE_SEVERITY corrigibles"
+
+                            set +e
+
+                            docker run \
+                            --rm \
+                            -v /var/run/docker.sock:/var/run/docker.sock \
+                            -v "$TRIVY_CACHE_VOLUME:/root/.cache" \
+                            "$TRIVY_IMAGE" \
+                            image \
+                            --image-src docker \
+                            --scanners vuln \
+                            --severity "$TRIVY_GATE_SEVERITY" \
+                            --ignore-unfixed \
+                            --skip-db-update \
+                            --skip-java-db-update \
+                            --offline-scan \
+                            --skip-version-check \
+                            --disable-telemetry \
+                            --no-progress \
+                            --exit-code 1 \
+                            --format table \
+                            "$IMMUTABLE_IMAGE_REF" \
+                            > "$REPORT_DIR/gate.txt"
+
+                            TRIVY_GATE_STATUS="$?"
+
+                            set -e
+
+                            echo
+                            cat "$REPORT_DIR/gate.txt"
+
+                            echo
+
+                            if [ "$TRIVY_GATE_STATUS" -ne 0 ]; then
+                                echo "SECURITY GATE TRIVY : REFUSÉ"
+                                echo
+                                echo \
+                                "Au moins une vulnérabilité $TRIVY_GATE_SEVERITY corrigible a été détectée."
+                                echo
+                                echo \
+                                "Le déploiement de cette image est interdit."
+
+                                exit 1
+                            fi
+
+                            echo "SECURITY GATE TRIVY : OK"
+                            echo
+                            echo "Image autorisée :"
+                            echo "$IMMUTABLE_IMAGE_REF"
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'trivy-reports/**/*',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+
+                    publishHTML(
+                        target: [
+                            reportDir: 'trivy-reports',
+                            reportFiles: 'image.html',
+                            reportName: 'Trivy - Image Frontend',
+                            reportTitles: 'Rapport de vulnérabilités Trivy',
+                            keepAll: true,
+                            alwaysLinkToLastBuild: true,
+                            allowMissing: true
+                        ]
+                    )
+                }
             }
         }
 

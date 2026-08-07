@@ -48,3 +48,5 @@ Thumbs.db
 
 # SonarQube scanner
 /.scannerwork/
+
+trivy-reports/
