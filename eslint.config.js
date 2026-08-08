@@ -17,6 +17,7 @@ module.exports = defineConfig([
       'cosign-reports/**',
       '.cosign-bin/**',
       'hardening-reports/**',
+      'nginx-optimization-reports/**',
       '.nginx/**',
       '.scannerwork/**'
     ]

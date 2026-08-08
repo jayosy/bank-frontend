@@ -250,6 +250,7 @@ pipeline {
                         .cosign-bin \
                         sbom-reports \
                         hardening-reports \
+                        nginx-optimization-reports \
                         dist \
                         .angular/cache
 
@@ -2421,6 +2422,220 @@ pipeline {
                 always {
                     archiveArtifacts(
                         artifacts: 'hardening-reports/**/*',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+                }
+            }
+        }
+
+        stage('Nginx optimization checks') {
+            steps {
+                timeout(
+                    time: 5,
+                    unit: 'MINUTES'
+                ) {
+                    sh '''
+                        set -eu
+
+                        REPORT_DIR="nginx-optimization-reports"
+
+                        rm -rf "$REPORT_DIR"
+
+                        mkdir -p "$REPORT_DIR"
+
+
+                        echo "=== Récupération index Angular ==="
+
+                        curl \
+                        -fsS \
+                        "$FRONT_INTERNAL_URL/" \
+                        > "$REPORT_DIR/index.html"
+
+
+                        echo
+                        echo "=== Recherche bundle JS hashé ==="
+
+                        MAIN_JS="$(
+                            node -e '
+                                const fs =
+                                    require("node:fs");
+
+                                const html =
+                                    fs.readFileSync(
+                                        "nginx-optimization-reports/index.html",
+                                        "utf8"
+                                    );
+
+                                const match =
+                                    html.match(
+                                        /src="([^"]*-[A-Za-z0-9]{8,}\\.js)"/
+                                    );
+
+                                if (!match) {
+                                    console.error(
+                                        "Bundle JS Angular hashé introuvable"
+                                    );
+
+                                    process.exit(1);
+                                }
+
+                                process.stdout.write(
+                                    match[1]
+                                );
+                            '
+                        )"
+
+
+                        case "$MAIN_JS" in
+                            /*)
+                                ;;
+                            *)
+                                MAIN_JS="/$MAIN_JS"
+                                ;;
+                        esac
+
+
+                        echo "Bundle principal : $MAIN_JS"
+
+
+                        echo
+                        echo "=== Cache index.html ==="
+
+                        curl \
+                        -fsS \
+                        -D "$REPORT_DIR/index-headers.raw" \
+                        -o /dev/null \
+                        "$FRONT_INTERNAL_URL/index.html"
+
+
+                        tr -d '\\r' \
+                        < "$REPORT_DIR/index-headers.raw" \
+                        > "$REPORT_DIR/index-headers.txt"
+
+
+                        cat "$REPORT_DIR/index-headers.txt"
+
+
+                        grep \
+                        -Eqi \
+                        '^Cache-Control:.*no-cache.*no-store.*must-revalidate' \
+                        "$REPORT_DIR/index-headers.txt"
+
+
+                        echo
+                        echo "=== Cache version.json ==="
+
+                        curl \
+                        -fsS \
+                        -D "$REPORT_DIR/version-headers.raw" \
+                        -o /dev/null \
+                        "$FRONT_INTERNAL_URL/version.json"
+
+
+                        tr -d '\\r' \
+                        < "$REPORT_DIR/version-headers.raw" \
+                        > "$REPORT_DIR/version-headers.txt"
+
+
+                        cat "$REPORT_DIR/version-headers.txt"
+
+
+                        grep \
+                        -Eqi \
+                        '^Cache-Control:.*no-store' \
+                        "$REPORT_DIR/version-headers.txt"
+
+
+                        echo
+                        echo "=== Cache bundle Angular ==="
+
+                        curl \
+                        -fsS \
+                        -D "$REPORT_DIR/asset-headers.raw" \
+                        -o /dev/null \
+                        "$FRONT_INTERNAL_URL$MAIN_JS"
+
+
+                        tr -d '\\r' \
+                        < "$REPORT_DIR/asset-headers.raw" \
+                        > "$REPORT_DIR/asset-headers.txt"
+
+
+                        cat "$REPORT_DIR/asset-headers.txt"
+
+
+                        grep \
+                        -Eqi \
+                        '^Cache-Control:.*max-age=31536000.*immutable' \
+                        "$REPORT_DIR/asset-headers.txt"
+
+
+                        echo
+                        echo "=== Compression gzip ==="
+
+                        curl \
+                        -fsS \
+                        -H 'Accept-Encoding: gzip' \
+                        -D "$REPORT_DIR/gzip-headers.raw" \
+                        -o /dev/null \
+                        "$FRONT_INTERNAL_URL$MAIN_JS"
+
+
+                        tr -d '\\r' \
+                        < "$REPORT_DIR/gzip-headers.raw" \
+                        > "$REPORT_DIR/gzip-headers.txt"
+
+
+                        cat "$REPORT_DIR/gzip-headers.txt"
+
+
+                        grep \
+                        -Eqi \
+                        '^Content-Encoding:[[:space:]]*gzip' \
+                        "$REPORT_DIR/gzip-headers.txt"
+
+
+                        grep \
+                        -Eqi \
+                        '^Vary:.*Accept-Encoding' \
+                        "$REPORT_DIR/gzip-headers.txt"
+
+
+                        echo
+                        echo "=== Vérification sécurité conservée ==="
+
+                        grep \
+                        -Eqi \
+                        '^X-Content-Type-Options:[[:space:]]*nosniff' \
+                        "$REPORT_DIR/gzip-headers.txt"
+
+
+                        grep \
+                        -Eqi \
+                        '^Content-Security-Policy:' \
+                        "$REPORT_DIR/gzip-headers.txt"
+
+
+                        printf \
+                        'mainJs=%s\\nindexCache=NO_CACHE\\nversionCache=NO_STORE\\nassetCache=IMMUTABLE_1Y\\ngzip=ENABLED\\nstatus=SUCCESS\\n' \
+                        "$MAIN_JS" \
+                        > "$REPORT_DIR/summary.properties"
+
+
+                        echo
+                        echo "=== NGINX OPTIMIZATION GATE : OK ==="
+
+                        cat \
+                        "$REPORT_DIR/summary.properties"
+                    '''
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'nginx-optimization-reports/**/*',
                         allowEmptyArchive: true,
                         fingerprint: true
                     )
