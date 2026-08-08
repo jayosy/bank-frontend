@@ -209,6 +209,21 @@ pipeline {
                                   "$ROLLBACK_IMAGE_REF"
                             )"
 
+                            TARGET_USER="$(
+                                docker image inspect \
+                                  --format '{{.Config.User}}' \
+                                  "$ROLLBACK_IMAGE_REF"
+                            )"
+
+                            echo "Utilisateur candidat : $TARGET_USER"
+
+                            case "$TARGET_USER" in
+                                ""|0|0:0|root|root:root)
+                                    echo "Rollback interdit : image exécutée en root."
+                                    exit 1
+                                    ;;
+                            esac
+
                             if [ "$TARGET_TITLE" != "bank-front" ]; then
                                 echo "L'image n'est pas une image bank-front."
                                 exit 1

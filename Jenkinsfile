@@ -249,6 +249,7 @@ pipeline {
                         cosign-reports \
                         .cosign-bin \
                         sbom-reports \
+                        hardening-reports \
                         dist \
                         .angular/cache
 
@@ -629,6 +630,97 @@ pipeline {
                     echo
                     echo "Image construite : $IMAGE_REF"
                 '''
+            }
+        }
+
+        stage('Container hardening checks') {
+            steps {
+                timeout(
+                    time: 5,
+                    unit: 'MINUTES'
+                ) {
+                    sh '''
+                        set -eu
+
+                        REPORT_DIR="hardening-reports"
+
+                        mkdir -p "$REPORT_DIR"
+
+                        echo "=== Vérification utilisateur Docker ==="
+
+                        IMAGE_USER="$(
+                            docker image inspect \
+                            --format '{{.Config.User}}' \
+                            "$IMAGE_REF"
+                        )"
+
+                        echo "Utilisateur image : $IMAGE_USER"
+
+                        case "$IMAGE_USER" in
+                            ""|0|0:0|root|root:root)
+                                echo "L'image tourne avec root."
+                                exit 1
+                                ;;
+                        esac
+
+
+                        echo
+                        echo "=== Vérification UID runtime ==="
+
+                        RUNTIME_UID="$(
+                            docker run \
+                            --rm \
+                            --entrypoint sh \
+                            "$IMAGE_REF" \
+                            -c 'id -u'
+                        )"
+
+                        echo "UID runtime : $RUNTIME_UID"
+
+                        if [ "$RUNTIME_UID" = "0" ]; then
+                            echo "Le processus utilise UID 0."
+                            exit 1
+                        fi
+
+
+                        echo
+                        echo "=== Test Nginx sous contraintes de sécurité ==="
+
+                        docker run \
+                        --rm \
+                        --read-only \
+                        --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
+                        --cap-drop ALL \
+                        --security-opt no-new-privileges:true \
+                        "$IMAGE_REF" \
+                        nginx -t
+
+
+                        printf \
+                        'image=%s\\nuser=%s\\nuid=%s\\nreadOnlyTest=SUCCESS\\ncapDropTest=SUCCESS\\nnoNewPrivilegesTest=SUCCESS\\n' \
+                        "$IMAGE_REF" \
+                        "$IMAGE_USER" \
+                        "$RUNTIME_UID" \
+                        > "$REPORT_DIR/image-hardening.properties"
+
+
+                        echo
+                        echo "=== Image hardening validé ==="
+
+                        cat \
+                        "$REPORT_DIR/image-hardening.properties"
+                    '''
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'hardening-reports/**/*',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+                }
             }
         }
 
@@ -2064,6 +2156,273 @@ pipeline {
                             echo "$IMMUTABLE_IMAGE_REF"
                         '''
                     }
+                }
+            }
+        }
+
+        stage('Runtime hardening checks') {
+            steps {
+                sh '''
+                    set -eu
+
+                    REPORT_DIR="hardening-reports"
+
+                    mkdir -p "$REPORT_DIR"
+
+                    CONTAINER_ID="$(
+                        docker compose ps \
+                        -q \
+                        bank-front
+                    )"
+
+                    if [ -z "$CONTAINER_ID" ]; then
+                        echo "Conteneur bank-front introuvable."
+                        exit 1
+                    fi
+
+
+                    echo "=== Runtime hardening ==="
+
+                    READ_ONLY="$(
+                        docker inspect \
+                        --format '{{.HostConfig.ReadonlyRootfs}}' \
+                        "$CONTAINER_ID"
+                    )"
+
+                    PIDS_LIMIT="$(
+                        docker inspect \
+                        --format '{{.HostConfig.PidsLimit}}' \
+                        "$CONTAINER_ID"
+                    )"
+
+                    MEMORY_LIMIT="$(
+                        docker inspect \
+                        --format '{{.HostConfig.Memory}}' \
+                        "$CONTAINER_ID"
+                    )"
+
+                    CPU_LIMIT="$(
+                        docker inspect \
+                        --format '{{.HostConfig.NanoCpus}}' \
+                        "$CONTAINER_ID"
+                    )"
+
+
+                    echo "ReadonlyRootfs : $READ_ONLY"
+                    echo "PidsLimit      : $PIDS_LIMIT"
+                    echo "Memory         : $MEMORY_LIMIT"
+                    echo "NanoCpus       : $CPU_LIMIT"
+
+
+                    if [ "$READ_ONLY" != "true" ]; then
+                        echo "Root filesystem non read-only."
+                        exit 1
+                    fi
+
+
+                    if [ "$PIDS_LIMIT" != "64" ]; then
+                        echo "PidsLimit inattendu."
+                        exit 1
+                    fi
+
+
+                    if [ "$MEMORY_LIMIT" != "134217728" ]; then
+                        echo "Limite mémoire inattendue."
+                        exit 1
+                    fi
+
+
+                    if [ "$CPU_LIMIT" != "500000000" ]; then
+                        echo "Limite CPU inattendue."
+                        exit 1
+                    fi
+
+
+                    echo
+                    echo "=== Capabilities ==="
+
+                    docker inspect \
+                    --format '{{range .HostConfig.CapDrop}}{{println .}}{{end}}' \
+                    "$CONTAINER_ID" \
+                    | tee "$REPORT_DIR/cap-drop.txt"
+
+                    grep \
+                    -Fqx \
+                    "ALL" \
+                    "$REPORT_DIR/cap-drop.txt"
+
+
+                    echo
+                    echo "=== no-new-privileges ==="
+
+                    docker inspect \
+                    --format '{{range .HostConfig.SecurityOpt}}{{println .}}{{end}}' \
+                    "$CONTAINER_ID" \
+                    | tee "$REPORT_DIR/security-options.txt"
+
+                    grep \
+                    -Fq \
+                    "no-new-privileges" \
+                    "$REPORT_DIR/security-options.txt"
+
+
+                    echo
+                    echo "=== UID du processus ==="
+
+                    RUNTIME_UID="$(
+                        docker exec \
+                        "$CONTAINER_ID" \
+                        id -u
+                    )"
+
+                    echo "UID : $RUNTIME_UID"
+
+                    if [ "$RUNTIME_UID" = "0" ]; then
+                        echo "Le conteneur tourne en root."
+                        exit 1
+                    fi
+
+
+                    echo
+                    echo "=== CapEff kernel ==="
+
+                    CAP_EFFECTIVE="$(
+                        docker exec \
+                        "$CONTAINER_ID" \
+                        sh -c \
+                        'awk "/^CapEff:/{print \\$2}" /proc/1/status'
+                    )"
+
+                    echo "CapEff : $CAP_EFFECTIVE"
+
+                    if [ "$CAP_EFFECTIVE" != "0000000000000000" ]; then
+                        echo "Des capabilities sont toujours actives."
+                        exit 1
+                    fi
+
+
+                    echo
+                    echo "=== NoNewPrivs kernel ==="
+
+                    NO_NEW_PRIVS="$(
+                        docker exec \
+                        "$CONTAINER_ID" \
+                        sh -c \
+                        'awk "/^NoNewPrivs:/{print \\$2}" /proc/1/status'
+                    )"
+
+                    echo "NoNewPrivs : $NO_NEW_PRIVS"
+
+                    if [ "$NO_NEW_PRIVS" != "1" ]; then
+                        echo "no-new-privileges n'est pas actif."
+                        exit 1
+                    fi
+
+
+                    echo
+                    echo "=== Test filesystem read-only ==="
+
+                    if docker exec \
+                        "$CONTAINER_ID" \
+                        sh -c \
+                        'touch /etc/hardening-write-test' \
+                        2>/dev/null
+                    then
+                        echo "ERREUR : écriture possible dans /etc."
+                        exit 1
+                    fi
+
+                    echo "/etc est bien read-only."
+
+
+                    echo
+                    echo "=== Test tmpfs ==="
+
+                    docker exec \
+                    "$CONTAINER_ID" \
+                    sh -c \
+                    'touch /tmp/hardening-test && rm /tmp/hardening-test'
+
+                    echo "/tmp reste writable."
+
+
+                    echo
+                    echo "=== Headers HTTP de sécurité ==="
+
+                    curl \
+                    -sS \
+                    -D "$REPORT_DIR/headers.txt" \
+                    -o /dev/null \
+                    "$FRONT_INTERNAL_URL/"
+
+                    cat \
+                    "$REPORT_DIR/headers.txt"
+
+
+                    grep \
+                    -qi \
+                    '^X-Content-Type-Options: nosniff' \
+                    "$REPORT_DIR/headers.txt"
+
+                    grep \
+                    -qi \
+                    '^X-Frame-Options: DENY' \
+                    "$REPORT_DIR/headers.txt"
+
+                    grep \
+                    -qi \
+                    '^Referrer-Policy:' \
+                    "$REPORT_DIR/headers.txt"
+
+                    grep \
+                    -qi \
+                    '^Permissions-Policy:' \
+                    "$REPORT_DIR/headers.txt"
+
+                    grep \
+                    -qi \
+                    '^Content-Security-Policy:' \
+                    "$REPORT_DIR/headers.txt"
+
+
+                    if grep \
+                        -Eqi \
+                        '^Server:[[:space:]]*nginx/[0-9]' \
+                        "$REPORT_DIR/headers.txt"
+                    then
+                        echo "La version Nginx est exposée."
+                        exit 1
+                    fi
+
+
+                    printf \
+                    'containerId=%s\\nruntimeUid=%s\\nreadonlyRootfs=%s\\npidsLimit=%s\\nmemoryLimit=%s\\nnanoCpus=%s\\ncapEffective=%s\\nnoNewPrivileges=%s\\nstatus=SUCCESS\\n' \
+                    "$CONTAINER_ID" \
+                    "$RUNTIME_UID" \
+                    "$READ_ONLY" \
+                    "$PIDS_LIMIT" \
+                    "$MEMORY_LIMIT" \
+                    "$CPU_LIMIT" \
+                    "$CAP_EFFECTIVE" \
+                    "$NO_NEW_PRIVS" \
+                    > "$REPORT_DIR/runtime-hardening.properties"
+
+
+                    echo
+                    echo "=== HARDENING SECURITY GATE : OK ==="
+
+                    cat \
+                    "$REPORT_DIR/runtime-hardening.properties"
+                '''
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'hardening-reports/**/*',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
                 }
             }
         }

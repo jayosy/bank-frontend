@@ -18,6 +18,25 @@ services:
 
     networks:
       - bank-net
+    
+    read_only: true
+
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    pids_limit: 64
+
+    mem_limit: 128m
+
+    cpus: 0.50
+
+    stop_grace_period: 10s
 
 networks:
   bank-net:

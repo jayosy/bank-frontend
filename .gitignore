@@ -60,3 +60,5 @@ cosign-reports/
 # Rollback CI artifacts
 rollback-reports/
 .cosign-rollback/
+
+hardening-reports/

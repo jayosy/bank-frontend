@@ -16,6 +16,7 @@ module.exports = defineConfig([
       'sbom-reports/**',
       'cosign-reports/**',
       '.cosign-bin/**',
+      'hardening-reports/**',
       '.nginx/**',
       '.scannerwork/**'
     ]
