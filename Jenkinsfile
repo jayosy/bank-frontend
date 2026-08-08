@@ -18,12 +18,15 @@ pipeline {
 
         NEXUS_DOCKER_REGISTRY = 'localhost:8084'
         NEXUS_DOCKER_API_URL  = 'http://host.docker.internal:8084'
+        NEXUS_COSIGN_REGISTRY = 'host.docker.internal:8084'
         IMAGE_REPOSITORY      = 'localhost:8084/bank-front'
 
         TRIVY_IMAGE = 'aquasec/trivy:0.72.0'
         TRIVY_CACHE_VOLUME = 'trivy-cache'
         TRIVY_REPORT_SEVERITY = 'HIGH,CRITICAL'
         TRIVY_GATE_SEVERITY = 'CRITICAL'
+
+        COSIGN_IMAGE = 'ghcr.io/sigstore/cosign/cosign:v3.0.6'
     }
 
     stages {
@@ -243,6 +246,8 @@ pipeline {
                         coverage \
                         coverage-publish \
                         trivy-reports \
+                        cosign-reports \
+                        .cosign-bin \
                         sbom-reports \
                         dist \
                         .angular/cache
@@ -1521,6 +1526,303 @@ pipeline {
                 always {
                     archiveArtifacts(
                         artifacts: 'sbom-reports/**/*',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+                }
+            }
+        }
+
+        stage('Cosign sign and verify') {
+            steps {
+                timeout(
+                    time: 10,
+                    unit: 'MINUTES'
+                ) {
+                    withCredentials([
+                        file(
+                            credentialsId: 'cosign-bank-front-private-key',
+                            variable: 'COSIGN_PRIVATE_KEY'
+                        ),
+                        string(
+                            credentialsId: 'cosign-bank-front-password',
+                            variable: 'COSIGN_PASSWORD'
+                        ),
+                        usernamePassword(
+                            credentialsId: 'nexus-publisher',
+                            usernameVariable: 'NEXUS_DOCKER_USERNAME',
+                            passwordVariable: 'NEXUS_DOCKER_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            COSIGN_BIN_DIR="$WORKSPACE/.cosign-bin"
+                            COSIGN_BIN="$COSIGN_BIN_DIR/cosign"
+                            REPORT_DIR="cosign-reports"
+
+                            rm -rf \
+                            "$COSIGN_BIN_DIR" \
+                            "$REPORT_DIR"
+
+                            mkdir -p \
+                            "$COSIGN_BIN_DIR" \
+                            "$REPORT_DIR"
+
+                            echo "=== Préflight Cosign ==="
+
+                            test -s "$COSIGN_PRIVATE_KEY"
+                            test -s security/cosign.pub
+                            test -s sbom-reports/summary.properties
+                            test -s sbom-reports/bank-front.cdx.json
+
+                            echo
+                            echo "=== Récupération du SHA-256 du SBOM ==="
+
+                            SBOM_SHA256="$(
+                                sed -n \
+                                's/^sbomSha256=//p' \
+                                sbom-reports/summary.properties |
+                                head -n 1
+                            )"
+
+                            if ! printf '%s' "$SBOM_SHA256" |
+                                grep -Eq '^[0-9a-f]{64}$'
+                            then
+                                echo "SHA-256 du SBOM invalide."
+                                echo "Valeur : $SBOM_SHA256"
+                                exit 1
+                            fi
+
+                            echo "SBOM SHA-256 : $SBOM_SHA256"
+
+                            echo
+                            echo "=== Construction de la référence Cosign ==="
+
+                            case "$IMMUTABLE_IMAGE_REF" in
+                                "$NEXUS_DOCKER_REGISTRY"/*)
+                                    IMAGE_PATH_AND_DIGEST="${IMMUTABLE_IMAGE_REF#*/}";;
+
+                                *)
+                                    echo "Référence immuable Nexus inattendue."
+                                    echo "Image : $IMMUTABLE_IMAGE_REF"
+                                    exit 1
+                                    ;;
+                            esac
+
+                            COSIGN_IMAGE_REF="${NEXUS_COSIGN_REGISTRY}/${IMAGE_PATH_AND_DIGEST}"
+
+                            echo "Référence canonique : $IMMUTABLE_IMAGE_REF"
+                            echo "Référence Cosign    : $COSIGN_IMAGE_REF"
+
+                            if ! printf '%s' "$COSIGN_IMAGE_REF" |
+                                grep -Fq "@$IMAGE_DIGEST"
+                            then
+                                echo "Le digest Cosign ne correspond pas à IMAGE_DIGEST."
+                                exit 1
+                            fi
+
+                            echo
+                            echo "=== Installation temporaire de Cosign ==="
+
+                            docker pull \
+                            "$COSIGN_IMAGE" \
+                            >/dev/null
+
+                            COSIGN_SOURCE_CONTAINER="$(
+                                docker create \
+                                "$COSIGN_IMAGE"
+                            )"
+
+                            cleanup() {
+                                if [ -n "${COSIGN_SOURCE_CONTAINER:-}" ]; then
+                                    docker rm \
+                                    -f \
+                                    "$COSIGN_SOURCE_CONTAINER" \
+                                    >/dev/null \
+                                    2>&1 ||
+                                    true
+                                fi
+
+                                rm -rf "$COSIGN_BIN_DIR"
+                            }
+
+                            trap cleanup EXIT HUP INT TERM
+
+                            docker cp \
+                            "$COSIGN_SOURCE_CONTAINER:/ko-app/cosign" \
+                            "$COSIGN_BIN"
+
+                            docker rm \
+                            "$COSIGN_SOURCE_CONTAINER" \
+                            >/dev/null
+
+                            COSIGN_SOURCE_CONTAINER=""
+
+                            chmod 0700 \
+                            "$COSIGN_BIN"
+
+                            echo
+                            echo "=== Version Cosign ==="
+
+                            "$COSIGN_BIN" \
+                            version \
+                            | tee "$REPORT_DIR/version.txt"
+
+                            echo
+                            echo "=== Signature de l'image ==="
+
+                            set +x
+
+                            if ! "$COSIGN_BIN" sign \
+                                --key "$COSIGN_PRIVATE_KEY" \
+                                --bundle "$REPORT_DIR/image.sigstore.json" \
+                                --yes \
+                                --allow-http-registry \
+                                --tlog-upload=false \
+                                --use-signing-config=false \
+                                --registry-username "$NEXUS_DOCKER_USERNAME" \
+                                --registry-password "$NEXUS_DOCKER_PASSWORD" \
+                                -a "application=bank-front" \
+                                -a "version=$APP_VERSION" \
+                                -a "gitCommit=$GIT_COMMIT_SHA" \
+                                -a "buildNumber=$BUILD_NUMBER" \
+                                -a "canonicalImage=$IMMUTABLE_IMAGE_REF" \
+                                -a "sbomSha256=$SBOM_SHA256" \
+                                "$COSIGN_IMAGE_REF"
+                            then
+                                set -x
+                                echo "Échec de la signature Cosign."
+                                exit 1
+                            fi
+
+                            set -x
+
+                            test -s \
+                            "$REPORT_DIR/image.sigstore.json"
+
+                            echo
+                            echo "Image signée avec succès."
+
+                            echo
+                            echo "=== Vérification cryptographique ==="
+
+                            set +x
+
+                            if ! "$COSIGN_BIN" verify \
+                                --key security/cosign.pub \
+                                --allow-http-registry \
+                                --insecure-ignore-tlog \
+                                --registry-username "$NEXUS_DOCKER_USERNAME" \
+                                --registry-password "$NEXUS_DOCKER_PASSWORD" \
+                                -a "application=bank-front" \
+                                -a "version=$APP_VERSION" \
+                                -a "gitCommit=$GIT_COMMIT_SHA" \
+                                -a "buildNumber=$BUILD_NUMBER" \
+                                -a "canonicalImage=$IMMUTABLE_IMAGE_REF" \
+                                -a "sbomSha256=$SBOM_SHA256" \
+                                --output json \
+                                "$COSIGN_IMAGE_REF" \
+                                > "$REPORT_DIR/verification.json"
+                            then
+                                set -x
+                                echo "Vérification Cosign refusée."
+                                exit 1
+                            fi
+
+                            set -x
+
+                            test -s \
+                            "$REPORT_DIR/verification.json"
+
+                            echo
+                            echo "=== Validation du résultat Cosign ==="
+
+                            node -e '
+                                const fs = require("node:fs");
+
+                                JSON.parse(
+                                    fs.readFileSync(
+                                        "cosign-reports/verification.json",
+                                        "utf8"
+                                    )
+                                );
+
+                                console.log(
+                                    "verification.json valide"
+                                );
+                            '
+
+                            if ! grep \
+                                -Fq \
+                                "$IMAGE_DIGEST" \
+                                "$REPORT_DIR/verification.json"
+                            then
+                                echo "Digest absent du résultat Cosign."
+                                exit 1
+                            fi
+
+                            if ! grep \
+                                -Fq \
+                                "$SBOM_SHA256" \
+                                "$REPORT_DIR/verification.json"
+                            then
+                                echo "SHA-256 SBOM absent de la signature."
+                                exit 1
+                            fi
+
+                            if ! grep \
+                                -Fq \
+                                "$GIT_COMMIT_SHA" \
+                                "$REPORT_DIR/verification.json"
+                            then
+                                echo "Commit Git absent de la signature."
+                                exit 1
+                            fi
+
+                            echo
+                            echo "=== Métadonnées de signature ==="
+
+                            PUBLIC_KEY_SHA256="$(
+                                sha256sum \
+                                security/cosign.pub |
+                                awk '{print $1}'
+                            )"
+
+                            printf \
+                            'application=%s\\nversion=%s\\nbuildNumber=%s\\ngitCommit=%s\\ncanonicalImage=%s\\ncosignImage=%s\\nimageDigest=%s\\nsbomSha256=%s\\npublicKeySha256=%s\\n' \
+                            "bank-front" \
+                            "$APP_VERSION" \
+                            "$BUILD_NUMBER" \
+                            "$GIT_COMMIT_SHA" \
+                            "$IMMUTABLE_IMAGE_REF" \
+                            "$COSIGN_IMAGE_REF" \
+                            "$IMAGE_DIGEST" \
+                            "$SBOM_SHA256" \
+                            "$PUBLIC_KEY_SHA256" \
+                            > "$REPORT_DIR/signature.properties"
+
+                            cat \
+                            "$REPORT_DIR/signature.properties"
+
+                            echo
+                            echo "=== COSIGN SECURITY GATE ==="
+                            echo "Signature valide."
+                            echo "Digest valide."
+                            echo "Commit Git valide."
+                            echo "SBOM lié cryptographiquement."
+                            echo
+                            echo "Image autorisée pour déploiement :"
+                            echo "$IMMUTABLE_IMAGE_REF"
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'cosign-reports/**/*',
                         allowEmptyArchive: true,
                         fingerprint: true
                     )

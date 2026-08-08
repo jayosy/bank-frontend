@@ -14,6 +14,8 @@ module.exports = defineConfig([
       '.angular/**',
       'trivy-reports/**',
       'sbom-reports/**',
+      'cosign-reports/**',
+      '.cosign-bin/**',
       '.nginx/**',
       '.scannerwork/**'
     ]
