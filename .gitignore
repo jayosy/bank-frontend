@@ -56,3 +56,7 @@ sbom-reports/
 .cosign-bootstrap/
 .cosign-bin/
 cosign-reports/
+
+# Rollback CI artifacts
+rollback-reports/
+.cosign-rollback/

@@ -1,0 +1,742 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+    }
+
+    tools {
+        nodejs 'nodejs-24'
+    }
+
+    parameters {
+        string(
+            name: 'ROLLBACK_IMAGE_REF',
+            defaultValue: '',
+            description: 'Référence immuable complète : localhost:8084/bank-front@sha256:...'
+        )
+
+        string(
+            name: 'ROLLBACK_REASON',
+            defaultValue: '',
+            description: 'Motif du rollback'
+        )
+
+        booleanParam(
+            name: 'CONFIRM_ROLLBACK',
+            defaultValue: false,
+            description: 'Je confirme le rollback vers ce digest'
+        )
+    }
+
+    environment {
+        FRONT_INTERNAL_URL = 'http://bank-front:8080'
+
+        NEXUS_DOCKER_REGISTRY = 'localhost:8084'
+        NEXUS_COSIGN_REGISTRY = 'host.docker.internal:8084'
+
+        IMAGE_REPOSITORY = 'localhost:8084/bank-front'
+
+        TRIVY_IMAGE = 'aquasec/trivy:0.72.0'
+        TRIVY_CACHE_VOLUME = 'trivy-cache'
+
+        COSIGN_IMAGE = 'ghcr.io/sigstore/cosign/cosign:v3.0.6'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate rollback request') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "=== Demande de rollback ==="
+                    echo "Image  : $ROLLBACK_IMAGE_REF"
+                    echo "Motif  : $ROLLBACK_REASON"
+
+                    if [ "$CONFIRM_ROLLBACK" != "true" ]; then
+                        echo "Rollback non confirmé."
+                        exit 1
+                    fi
+
+                    if [ -z "$ROLLBACK_REASON" ]; then
+                        echo "Le motif du rollback est obligatoire."
+                        exit 1
+                    fi
+
+                    case "$ROLLBACK_IMAGE_REF" in
+                        "$IMAGE_REPOSITORY"@sha256:*)
+                            ;;
+                        *)
+                            echo "Référence rollback invalide."
+                            echo
+                            echo "Format attendu :"
+                            echo "$IMAGE_REPOSITORY@sha256:<64 caractères hex>"
+                            exit 1
+                            ;;
+                    esac
+
+                    TARGET_DIGEST="${ROLLBACK_IMAGE_REF##*@}"
+
+                    if ! printf '%s' "$TARGET_DIGEST" |
+                        grep -Eq '^sha256:[0-9a-f]{64}$'
+                    then
+                        echo "Digest SHA-256 invalide : $TARGET_DIGEST"
+                        exit 1
+                    fi
+
+                    test -f compose.yaml
+                    test -s security/cosign.pub
+
+                    docker network inspect \
+                      bank-net \
+                      >/dev/null
+
+                    docker volume inspect \
+                      "$TRIVY_CACHE_VOLUME" \
+                      >/dev/null
+
+                    echo
+                    echo "Demande rollback validée."
+                    echo "Digest : $TARGET_DIGEST"
+                '''
+            }
+        }
+
+        stage('Rollback security gate') {
+            steps {
+                timeout(
+                    time: 10,
+                    unit: 'MINUTES'
+                ) {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'nexus-publisher',
+                            usernameVariable: 'NEXUS_DOCKER_USERNAME',
+                            passwordVariable: 'NEXUS_DOCKER_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            REPORT_DIR="rollback-reports"
+                            COSIGN_BIN_DIR="$WORKSPACE/.cosign-rollback"
+                            COSIGN_BIN="$COSIGN_BIN_DIR/cosign"
+
+                            export DOCKER_CONFIG="$WORKSPACE/.docker-rollback-gate"
+
+                            rm -rf \
+                              "$REPORT_DIR" \
+                              "$COSIGN_BIN_DIR" \
+                              "$DOCKER_CONFIG"
+
+                            mkdir -p \
+                              "$REPORT_DIR" \
+                              "$COSIGN_BIN_DIR" \
+                              "$DOCKER_CONFIG"
+
+                            cleanup() {
+                                rm -rf \
+                                  "$COSIGN_BIN_DIR" \
+                                  "$DOCKER_CONFIG"
+                            }
+
+                            trap cleanup EXIT HUP INT TERM
+
+                            echo "=== Authentification Nexus ==="
+
+                            set +x
+
+                            if ! printf '%s' "$NEXUS_DOCKER_PASSWORD" |
+                                docker login \
+                                  "$NEXUS_DOCKER_REGISTRY" \
+                                  --username "$NEXUS_DOCKER_USERNAME" \
+                                  --password-stdin \
+                                  >/dev/null
+                            then
+                                set -x
+                                echo "Connexion Nexus impossible."
+                                exit 1
+                            fi
+
+                            set -x
+
+                            echo
+                            echo "=== Pull du candidat rollback ==="
+
+                            docker pull \
+                              "$ROLLBACK_IMAGE_REF"
+
+                            docker image inspect \
+                              "$ROLLBACK_IMAGE_REF" \
+                              >/dev/null
+
+                            REPO_DIGESTS="$(
+                                docker image inspect \
+                                  --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                                  "$ROLLBACK_IMAGE_REF"
+                            )"
+
+                            if ! printf '%s\n' "$REPO_DIGESTS" |
+                                grep -Fqx "$ROLLBACK_IMAGE_REF"
+                            then
+                                echo "RepoDigest incohérent."
+                                exit 1
+                            fi
+
+                            TARGET_VERSION="$(
+                                docker image inspect \
+                                  --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+                                  "$ROLLBACK_IMAGE_REF"
+                            )"
+
+                            TARGET_REVISION="$(
+                                docker image inspect \
+                                  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                                  "$ROLLBACK_IMAGE_REF"
+                            )"
+
+                            TARGET_TITLE="$(
+                                docker image inspect \
+                                  --format '{{ index .Config.Labels "org.opencontainers.image.title" }}' \
+                                  "$ROLLBACK_IMAGE_REF"
+                            )"
+
+                            if [ "$TARGET_TITLE" != "bank-front" ]; then
+                                echo "L'image n'est pas une image bank-front."
+                                exit 1
+                            fi
+
+                            echo "Version candidate : $TARGET_VERSION"
+                            echo "Commit candidat   : $TARGET_REVISION"
+
+                            echo
+                            echo "=== Installation temporaire Cosign ==="
+
+                            docker pull \
+                              "$COSIGN_IMAGE" \
+                              >/dev/null
+
+                            COSIGN_CONTAINER="$(
+                                docker create "$COSIGN_IMAGE"
+                            )"
+
+                            docker cp \
+                              "$COSIGN_CONTAINER:/ko-app/cosign" \
+                              "$COSIGN_BIN"
+
+                            docker rm \
+                              "$COSIGN_CONTAINER" \
+                              >/dev/null
+
+                            chmod 0700 \
+                              "$COSIGN_BIN"
+
+                            IMAGE_PATH_AND_DIGEST="${ROLLBACK_IMAGE_REF#*/}"
+
+                            COSIGN_IMAGE_REF="${NEXUS_COSIGN_REGISTRY}/${IMAGE_PATH_AND_DIGEST}"
+
+                            echo
+                            echo "=== Vérification Cosign ==="
+                            echo "Image : $COSIGN_IMAGE_REF"
+
+                            set +x
+
+                            if ! "$COSIGN_BIN" verify \
+                                --key security/cosign.pub \
+                                --allow-http-registry \
+                                --insecure-ignore-tlog \
+                                --registry-username "$NEXUS_DOCKER_USERNAME" \
+                                --registry-password "$NEXUS_DOCKER_PASSWORD" \
+                                -a "application=bank-front" \
+                                -a "version=$TARGET_VERSION" \
+                                -a "gitCommit=$TARGET_REVISION" \
+                                -a "canonicalImage=$ROLLBACK_IMAGE_REF" \
+                                --output json \
+                                "$COSIGN_IMAGE_REF" \
+                                > "$REPORT_DIR/cosign-verification.json"
+                            then
+                                set -x
+                                echo "Signature Cosign invalide."
+                                exit 1
+                            fi
+
+                            set -x
+
+                            test -s \
+                              "$REPORT_DIR/cosign-verification.json"
+
+                            if ! grep \
+                                -Fq \
+                                '"sbomSha256"' \
+                                "$REPORT_DIR/cosign-verification.json"
+                            then
+                                echo "La signature ne référence aucun SBOM."
+                                exit 1
+                            fi
+
+                            echo "Signature Cosign : OK"
+
+                            echo
+                            echo "=== Trivy rollback security gate ==="
+
+                            set +e
+
+                            docker run \
+                              --rm \
+                              -v /var/run/docker.sock:/var/run/docker.sock \
+                              -v "$TRIVY_CACHE_VOLUME:/root/.cache" \
+                              "$TRIVY_IMAGE" \
+                              image \
+                              --image-src docker \
+                              --scanners vuln \
+                              --severity CRITICAL \
+                              --ignore-unfixed \
+                              --skip-db-update \
+                              --skip-java-db-update \
+                              --offline-scan \
+                              --skip-version-check \
+                              --disable-telemetry \
+                              --no-progress \
+                              --exit-code 1 \
+                              --format table \
+                              "$ROLLBACK_IMAGE_REF" \
+                              > "$REPORT_DIR/trivy-gate.txt"
+
+                            TRIVY_STATUS="$?"
+
+                            set -e
+
+                            cat \
+                              "$REPORT_DIR/trivy-gate.txt"
+
+                            if [ "$TRIVY_STATUS" -ne 0 ]; then
+                                echo "Le candidat rollback ne passe plus le Security Gate."
+                                exit 1
+                            fi
+
+                            TARGET_DIGEST="${ROLLBACK_IMAGE_REF##*@}"
+
+                            printf \
+                              'image=%s\ndigest=%s\nversion=%s\ngitCommit=%s\nreason=%s\n' \
+                              "$ROLLBACK_IMAGE_REF" \
+                              "$TARGET_DIGEST" \
+                              "$TARGET_VERSION" \
+                              "$TARGET_REVISION" \
+                              "$ROLLBACK_REASON" \
+                              > "$REPORT_DIR/candidate.properties"
+
+                            echo
+                            echo "=== Candidat rollback autorisé ==="
+
+                            cat \
+                              "$REPORT_DIR/candidate.properties"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Execute rollback') {
+            steps {
+                timeout(
+                    time: 10,
+                    unit: 'MINUTES'
+                ) {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'nexus-publisher',
+                            usernameVariable: 'NEXUS_DOCKER_USERNAME',
+                            passwordVariable: 'NEXUS_DOCKER_PASSWORD'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            REPORT_DIR="rollback-reports"
+
+                            export DOCKER_CONFIG="$WORKSPACE/.docker-rollback"
+
+                            rm -rf "$DOCKER_CONFIG"
+                            mkdir -p "$DOCKER_CONFIG"
+
+                            cleanup() {
+                                rm -rf "$DOCKER_CONFIG"
+                            }
+
+                            trap cleanup EXIT HUP INT TERM
+
+                            echo "=== Capture du déploiement actuel ==="
+
+                            CURRENT_CONTAINER_ID="$(
+                                docker compose ps \
+                                  -q \
+                                  bank-front
+                            )"
+
+                            if [ -z "$CURRENT_CONTAINER_ID" ]; then
+                                echo "Aucun conteneur bank-front actuellement déployé."
+                                exit 1
+                            fi
+
+                            PREVIOUS_IMAGE_REF="$(
+                                docker inspect \
+                                  --format '{{.Config.Image}}' \
+                                  "$CURRENT_CONTAINER_ID"
+                            )"
+
+                            PREVIOUS_IMAGE_ID="$(
+                                docker inspect \
+                                  --format '{{.Image}}' \
+                                  "$CURRENT_CONTAINER_ID"
+                            )"
+
+                            case "$PREVIOUS_IMAGE_REF" in
+                                "$IMAGE_REPOSITORY"@sha256:*)
+                                    ;;
+                                *)
+                                    echo "L'image actuellement déployée n'est pas référencée par digest."
+                                    echo "$PREVIOUS_IMAGE_REF"
+                                    exit 1
+                                    ;;
+                            esac
+
+                            if [ "$PREVIOUS_IMAGE_REF" = "$ROLLBACK_IMAGE_REF" ]; then
+                                echo "L'image demandée est déjà déployée."
+                                exit 1
+                            fi
+
+                            printf \
+                              'previousImage=%s\npreviousImageId=%s\npreviousContainer=%s\n' \
+                              "$PREVIOUS_IMAGE_REF" \
+                              "$PREVIOUS_IMAGE_ID" \
+                              "$CURRENT_CONTAINER_ID" \
+                              > "$REPORT_DIR/before.properties"
+
+                            cat \
+                              "$REPORT_DIR/before.properties"
+
+                            echo
+                            echo "=== Connexion Nexus ==="
+
+                            set +x
+
+                            if ! printf '%s' "$NEXUS_DOCKER_PASSWORD" |
+                                docker login \
+                                  "$NEXUS_DOCKER_REGISTRY" \
+                                  --username "$NEXUS_DOCKER_USERNAME" \
+                                  --password-stdin \
+                                  >/dev/null
+                            then
+                                set -x
+                                exit 1
+                            fi
+
+                            set -x
+
+                            echo
+                            echo "=== Déploiement rollback ==="
+
+                            docker pull \
+                              "$ROLLBACK_IMAGE_REF"
+
+                            export BANK_FRONT_IMAGE="$ROLLBACK_IMAGE_REF"
+
+                            RESOLVED_IMAGE="$(
+                                docker compose config \
+                                  --images |
+                                head -n 1
+                            )"
+
+                            if [ "$RESOLVED_IMAGE" != "$ROLLBACK_IMAGE_REF" ]; then
+                                echo "Compose ne référence pas le candidat rollback."
+                                exit 1
+                            fi
+
+                            docker compose up \
+                              -d \
+                              --no-build \
+                              --pull never \
+                              --force-recreate \
+                              bank-front
+
+                            ROLLBACK_CONTAINER_ID="$(
+                                docker compose ps \
+                                  -q \
+                                  bank-front
+                            )"
+
+                            test -n \
+                              "$ROLLBACK_CONTAINER_ID"
+
+                            ACTIVE_REF="$(
+                                docker inspect \
+                                  --format '{{.Config.Image}}' \
+                                  "$ROLLBACK_CONTAINER_ID"
+                            )"
+
+                            ACTIVE_IMAGE_ID="$(
+                                docker inspect \
+                                  --format '{{.Image}}' \
+                                  "$ROLLBACK_CONTAINER_ID"
+                            )"
+
+                            EXPECTED_IMAGE_ID="$(
+                                docker image inspect \
+                                  --format '{{.Id}}' \
+                                  "$ROLLBACK_IMAGE_REF"
+                            )"
+
+                            if [ "$ACTIVE_REF" != "$ROLLBACK_IMAGE_REF" ]; then
+                                echo "Référence rollback non utilisée."
+                                exit 1
+                            fi
+
+                            if [ "$ACTIVE_IMAGE_ID" != "$EXPECTED_IMAGE_ID" ]; then
+                                echo "Image ID rollback incorrecte."
+                                exit 1
+                            fi
+
+                            echo
+                            echo "=== Smoke tests rollback ==="
+
+                            smoke_test() {
+                                attempt=1
+
+                                while [ "$attempt" -le 12 ]
+                                do
+                                    HTTP_CODE="$(
+                                        curl \
+                                          -sS \
+                                          --connect-timeout 3 \
+                                          --max-time 5 \
+                                          -o "$REPORT_DIR/frontend-health.json" \
+                                          -w '%{http_code}' \
+                                          "$FRONT_INTERNAL_URL/health" ||
+                                        true
+                                    )"
+
+                                    if [ "$HTTP_CODE" = "200" ]; then
+                                        break
+                                    fi
+
+                                    attempt=$((attempt + 1))
+                                    sleep 5
+                                done
+
+                                if [ "$HTTP_CODE" != "200" ]; then
+                                    return 1
+                                fi
+
+                                if ! grep \
+                                    -q '"status":"UP"' \
+                                    "$REPORT_DIR/frontend-health.json"
+                                then
+                                    return 1
+                                fi
+
+                                BACKEND_HTTP_CODE="$(
+                                    curl \
+                                      -sS \
+                                      --connect-timeout 3 \
+                                      --max-time 10 \
+                                      -o "$REPORT_DIR/backend-health.json" \
+                                      -w '%{http_code}' \
+                                      "$FRONT_INTERNAL_URL/actuator/health" ||
+                                    true
+                                )"
+
+                                if [ "$BACKEND_HTTP_CODE" != "200" ]; then
+                                    return 1
+                                fi
+
+                                if ! curl \
+                                    -fsS \
+                                    --connect-timeout 3 \
+                                    --max-time 10 \
+                                    "$FRONT_INTERNAL_URL/" |
+                                    grep -q '<bank-root'
+                                then
+                                    return 1
+                                fi
+
+                                if ! curl \
+                                    -fsS \
+                                    "$FRONT_INTERNAL_URL/version.json" \
+                                    > "$REPORT_DIR/deployed-version.json"
+                                then
+                                    return 1
+                                fi
+
+                                TARGET_VERSION="$(
+                                    sed -n \
+                                      's/^version=//p' \
+                                      "$REPORT_DIR/candidate.properties" |
+                                    head -n 1
+                                )"
+
+                                TARGET_REVISION="$(
+                                    sed -n \
+                                      's/^gitCommit=//p' \
+                                      "$REPORT_DIR/candidate.properties" |
+                                    head -n 1
+                                )"
+
+                                if ! TARGET_VERSION="$TARGET_VERSION" \
+                                    TARGET_REVISION="$TARGET_REVISION" \
+                                    node -e '
+                                        const fs = require("node:fs");
+
+                                        const version = JSON.parse(
+                                          fs.readFileSync(
+                                            "rollback-reports/deployed-version.json",
+                                            "utf8"
+                                          )
+                                        );
+
+                                        if (version.application !== "bank-front") {
+                                          process.exit(1);
+                                        }
+
+                                        if (version.version !== process.env.TARGET_VERSION) {
+                                          process.exit(1);
+                                        }
+
+                                        if (version.gitCommit !== process.env.TARGET_REVISION) {
+                                          process.exit(1);
+                                        }
+
+                                        console.log(
+                                          `Rollback applicatif validé : ${version.version}`
+                                        );
+
+                                        console.log(
+                                          `Commit restauré : ${version.gitCommit}`
+                                        );
+                                    '
+                                then
+                                    return 1
+                                fi
+
+                                return 0
+                            }
+
+                            if smoke_test
+                            then
+                                echo
+                                echo "ROLLBACK VALIDÉ"
+
+                                TARGET_DIGEST="${ROLLBACK_IMAGE_REF##*@}"
+
+                                printf \
+                                  'status=SUCCESS\npreviousImage=%s\nrollbackImage=%s\nrollbackDigest=%s\ncontainerId=%s\nrunningImageId=%s\nreason=%s\n' \
+                                  "$PREVIOUS_IMAGE_REF" \
+                                  "$ROLLBACK_IMAGE_REF" \
+                                  "$TARGET_DIGEST" \
+                                  "$ROLLBACK_CONTAINER_ID" \
+                                  "$ACTIVE_IMAGE_ID" \
+                                  "$ROLLBACK_REASON" \
+                                  > "$REPORT_DIR/result.properties"
+
+                                cat \
+                                  "$REPORT_DIR/result.properties"
+
+                                exit 0
+                            fi
+
+                            echo
+                            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                            echo "LE ROLLBACK A ÉCHOUÉ AUX SMOKE TESTS"
+                            echo "RESTAURATION AUTOMATIQUE"
+                            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                            echo
+
+                            docker pull \
+                              "$PREVIOUS_IMAGE_REF"
+
+                            export BANK_FRONT_IMAGE="$PREVIOUS_IMAGE_REF"
+
+                            docker compose up \
+                              -d \
+                              --no-build \
+                              --pull never \
+                              --force-recreate \
+                              bank-front
+
+                            RESTORED_CONTAINER_ID="$(
+                                docker compose ps \
+                                  -q \
+                                  bank-front
+                            )"
+
+                            RESTORED_REF="$(
+                                docker inspect \
+                                  --format '{{.Config.Image}}' \
+                                  "$RESTORED_CONTAINER_ID"
+                            )"
+
+                            if [ "$RESTORED_REF" != "$PREVIOUS_IMAGE_REF" ]; then
+                                echo "ERREUR CRITIQUE : restauration automatique impossible."
+                                exit 2
+                            fi
+
+                            RESTORE_HTTP_CODE="$(
+                                curl \
+                                  -sS \
+                                  --retry 10 \
+                                  --retry-delay 3 \
+                                  --retry-connrefused \
+                                  -o "$REPORT_DIR/restored-health.json" \
+                                  -w '%{http_code}' \
+                                  "$FRONT_INTERNAL_URL/health" ||
+                                true
+                            )"
+
+                            printf \
+                              'status=ROLLBACK_FAILED_PREVIOUS_RESTORED\npreviousImage=%s\nfailedRollbackImage=%s\nrestoredImage=%s\nrestoreHttpCode=%s\nreason=%s\n' \
+                              "$PREVIOUS_IMAGE_REF" \
+                              "$ROLLBACK_IMAGE_REF" \
+                              "$RESTORED_REF" \
+                              "$RESTORE_HTTP_CODE" \
+                              "$ROLLBACK_REASON" \
+                              > "$REPORT_DIR/result.properties"
+
+                            cat \
+                              "$REPORT_DIR/result.properties"
+
+                            echo
+                            echo "L'image précédente a été restaurée."
+
+                            exit 1
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Rollback frontend terminé avec succès.'
+        }
+
+        failure {
+            echo 'Le job rollback a échoué. Vérifier rollback-reports.'
+        }
+
+        always {
+            archiveArtifacts(
+                artifacts: 'rollback-reports/**/*',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+        }
+    }
+}
