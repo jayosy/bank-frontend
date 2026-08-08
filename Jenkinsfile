@@ -688,6 +688,7 @@ pipeline {
 
                         docker run \
                         --rm \
+                        --network bank-net \
                         --read-only \
                         --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
                         --cap-drop ALL \
